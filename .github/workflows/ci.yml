@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Format, tests, SDK ABIs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: contracts
+
+      - uses: foundry-rs/foundry-toolchain@v1
+
+      # lib/ is not versioned; the pinned versions live here and in the README.
+      - uses: actions/cache@v4
+        id: libs
+        with:
+          path: contracts/lib
+          key: lib-forge-std-v1.17.0-oz-v5.4.0-v3core-0.8
+
+      - name: Dependencies
+        if: steps.libs.outputs.cache-hit != 'true'
+        working-directory: contracts
+        run: |
+          forge install foundry-rs/forge-std@v1.17.0 --no-git
+          forge install OpenZeppelin/openzeppelin-contracts@v5.4.0 --no-git
+          forge install Uniswap/v3-core@0.8 --no-git
+
+      - name: Format
+        working-directory: contracts
+        run: forge fmt --check
+
+      - name: Tests
+        working-directory: contracts
+        run: forge test
+
+      - name: Contract sizes
+        working-directory: contracts
+        run: forge build --sizes
+
+      # The SDK ships ABIs generated from these contracts. Regenerating them
+      # here and comparing is what keeps a contract from changing without the
+      # SDK following — the failure would be a wrongly built transaction in
+      # someone's app. Interface changed? Release the SDK with the new ABIs
+      # first; then this job passes again.
+      - uses: actions/checkout@v4
+        with:
+          repository: lucrios-finance/sdk
+          path: sdk
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: SDK ABIs are up to date
+        run: |
+          node sdk/scripts/sync-abis.mjs
+          git -C sdk diff --exit-code src/abis \
+            || { echo "::error::the SDK ABIs (lucrios-finance/sdk) do not match these contracts — run 'npm run sync-abis' there and release it"; exit 1; }
