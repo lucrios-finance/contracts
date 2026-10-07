@@ -6,6 +6,7 @@ import {Ownable, Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {InstanceArt} from "./InstanceArt.sol";
 
 /// Consultado antes de cada transferência de NFT. Implementado pelo contrato
 /// de execução: uma instância com posição aberta não muda de dono, porque os
@@ -271,6 +272,15 @@ contract BotInstanceNFT is ERC721, Ownable2Step, ReentrancyGuard {
     function setTransferGuard(ITransferGuard guard) external onlyOwner {
         transferGuard = guard;
         emit TransferGuardSet(address(guard));
+    }
+
+    // ===== metadados =====
+
+    /// Nome, descrição e imagem gerados on-chain (ver `InstanceArt`): não há
+    /// URL para sair do ar nem para alguém trocar.
+    function tokenURI(uint256 tokenId) public view override returns (string memory) {
+        _requireOwned(tokenId);
+        return InstanceArt.tokenURI(tokenId);
     }
 
     // ===== transferência =====

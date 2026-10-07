@@ -12,6 +12,7 @@ its owner's wallet.
 | Contract | What it does |
 |---|---|
 | `BotInstanceNFT` | ERC-721 where each token is one bot instance. Paid mint in rounds (price and supply set by the owner multisig), credit top-ups, partner revenue share, and pull-based withdrawals. |
+| `InstanceArt` | The token metadata, built on-chain: `tokenURI` returns the name, description and an SVG image as a `data:` URI. No server, IPFS or gateway is involved. |
 | `TradeExecutor` | Executes the trades of the instances. Funds stay in the owner's wallet; the executor moves them by allowance only for the duration of a swap and sends the result back to the owner. Charges the profit fee above each instance's high-water mark. Not upgradeable. |
 | `UniswapV4Adapter` | Swaps directly on a Uniswap v4 pool. A stateless target for the executor's aggregator path, kept outside the contract that holds user allowances. |
 
