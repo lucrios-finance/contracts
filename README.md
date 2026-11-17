@@ -100,6 +100,30 @@ fit in 24 KB without it).
 
 The code comments are in Portuguese.
 
+### Deploying
+
+`script/Deploy.s.sol` deploys `BotInstanceNFT` and `TradeExecutor`, sets the
+operator as minter, allows the aggregators and quote tokens, and hands both
+contracts to `OWNER` (two-step: the owner calls `acceptOwnership`). Outside a
+local chain it refuses an `OWNER` equal to the deployer. Addresses go to
+`deployments/<chainid>.json`.
+
+```bash
+OWNER=0x… TREASURY=0x… OPERATOR=0x… WETH=0x… VOLUME_FEE_BPS=50 \
+AGGREGATORS=0x…,0x… QUOTE_TOKENS=0x… \
+forge script script/Deploy.s.sol --rpc-url $RPC --broadcast --private-key $DEPLOYER_KEY
+```
+
+`script/Local.s.sol` builds a ready local chain for end-to-end tests: mock
+WETH, token and aggregator, the contracts, house bot 900001 with its vault
+funded and limits set (`deployments/local.json`). CI runs it on anvil, and the
+backend runs its vault tests against that chain.
+
+```bash
+anvil &
+forge script script/Local.s.sol --rpc-url http://127.0.0.1:8545 --broadcast
+```
+
 The TypeScript SDK ([`@lucrios/sdk`](https://github.com/lucrios-finance/sdk))
 ships ABIs generated from these contracts; CI fails when they drift apart.
 

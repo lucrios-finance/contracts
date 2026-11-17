@@ -50,6 +50,17 @@ jobs:
         working-directory: contracts
         run: forge build --sizes
 
+      # O deploy de verdade passa pelo mesmo `Deploy.deploy` que o script
+      # local: implantar numa chain (anvil) é o teste dele. O backend roda os
+      # testes de ponta a ponta contra esta mesma chain.
+      - name: Deploy on a local chain (anvil)
+        working-directory: contracts
+        run: |
+          anvil --port 8545 --silent &
+          for _ in $(seq 1 30); do cast chain-id >/dev/null 2>&1 && break; sleep 1; done
+          forge script script/Local.s.sol --rpc-url http://127.0.0.1:8545 --broadcast
+          cat deployments/local.json
+
       # The SDK ships ABIs generated from these contracts. Regenerating them
       # here and comparing is what keeps a contract from changing without the
       # SDK following — the failure would be a wrongly built transaction in
