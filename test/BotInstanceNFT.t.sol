@@ -480,4 +480,55 @@ contract BotInstanceNFTTest is Test {
         nft.transferFrom(alice, bob, 1);
         assertEq(nft.ownerOf(1), bob);
     }
+
+    // ===== mint pelo minter =====
+
+    function test_minterMintsAChosenIdForFree() public {
+        address minter = makeAddr("minter");
+        vm.prank(owner);
+        nft.setMinter(minter);
+
+        vm.expectEmit();
+        emit Minted(900_000, alice, address(0), ETH, 0);
+        vm.prank(minter);
+        nft.mintTo(alice, 900_000);
+        assertEq(nft.ownerOf(900_000), alice);
+        // Não conta na rodada de venda.
+        assertEq(nft.totalMinted(), 0);
+
+        vm.expectRevert(abi.encodeWithSelector(BotInstanceNFT.TokenIdTaken.selector, 900_000));
+        vm.prank(minter);
+        nft.mintTo(bob, 900_000);
+
+        vm.expectRevert(abi.encodeWithSelector(BotInstanceNFT.UnknownInstance.selector, 0));
+        vm.prank(minter);
+        nft.mintTo(bob, 0);
+
+        // O multisig também cunha.
+        vm.prank(owner);
+        nft.mintTo(bob, 7);
+        assertEq(nft.ownerOf(7), bob);
+    }
+
+    function test_onlyTheMinterOrTheMultisigMintsForFree() public {
+        vm.expectRevert(BotInstanceNFT.NotMinter.selector);
+        vm.prank(alice);
+        nft.mintTo(alice, 5);
+
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        vm.prank(alice);
+        nft.setMinter(alice);
+    }
+
+    function test_paidMintSkipsIdsTheMinterAlreadyUsed() public {
+        vm.startPrank(owner);
+        nft.mintTo(bob, 1);
+        nft.mintTo(bob, 2);
+        vm.stopPrank();
+
+        vm.prank(alice);
+        uint256 tokenId = nft.mint{value: PRICE}(address(0));
+        assertEq(tokenId, 3);
+        assertEq(nft.ownerOf(3), alice);
+    }
 }

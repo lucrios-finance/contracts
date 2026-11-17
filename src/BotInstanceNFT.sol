@@ -8,9 +8,9 @@ import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {InstanceArt} from "./InstanceArt.sol";
 
-/// Consultado antes de cada transferência de NFT. Implementado pelo contrato
-/// de execução: uma instância com posição aberta não muda de dono, porque os
-/// allowances que sustentam a posição são da carteira antiga.
+/// Consultado antes de cada transferência de NFT, se configurado. O executor
+/// atual não precisa: os fundos de uma instância ficam no cofre dela, que
+/// acompanha o NFT. Fica para um executor futuro que precise travar.
 interface ITransferGuard {
     function isLocked(uint256 tokenId) external view returns (bool);
 }
@@ -60,6 +60,10 @@ contract BotInstanceNFT is ERC721, Ownable2Step, ReentrancyGuard {
 
     ITransferGuard public transferGuard;
 
+    /// Quem cunha instâncias de graça, com o id escolhido: o backend, ao
+    /// criar um agente, e o multisig. O id é o mesmo da instância no backend.
+    address public minter;
+
     event Minted(
         uint256 indexed tokenId, address indexed owner, address indexed feeRecipient, address token, uint256 price
     );
@@ -74,6 +78,7 @@ contract BotInstanceNFT is ERC721, Ownable2Step, ReentrancyGuard {
     event OperatorSet(address operator, uint256 gasFloatTarget);
     event PartnerSharesSet(address indexed partner, uint256 mintShareBps, uint256 topUpShareBps);
     event TransferGuardSet(address guard);
+    event MinterSet(address minter);
 
     error SoldOut();
     error TokenNotAccepted(address token);
@@ -86,6 +91,8 @@ contract BotInstanceNFT is ERC721, Ownable2Step, ReentrancyGuard {
     error NothingToWithdraw();
     error EthTransferFailed();
     error InstanceLocked(uint256 tokenId);
+    error NotMinter();
+    error TokenIdTaken(uint256 tokenId);
 
     constructor(address initialOwner, address treasury_, uint256 maxSupply_, uint256 ethMintPrice)
         ERC721("Lucrios Bot", "LUCRIOS")
@@ -139,9 +146,22 @@ contract BotInstanceNFT is ERC721, Ownable2Step, ReentrancyGuard {
         returns (uint256 tokenId)
     {
         if (totalMinted >= maxSupply) revert SoldOut();
-        tokenId = ++totalMinted;
+        // Pula os ids que o minter já usou.
+        do {
+            tokenId = ++totalMinted;
+        } while (_ownerOf(tokenId) != address(0));
         _mint(to, tokenId);
         emit Minted(tokenId, to, feeRecipient, token, price);
+    }
+
+    /// Cunha de graça a instância `tokenId` para `to`. Não conta na rodada de
+    /// venda (`maxSupply`).
+    function mintTo(address to, uint256 tokenId) external {
+        if (msg.sender != minter && msg.sender != owner()) revert NotMinter();
+        if (tokenId == 0) revert UnknownInstance(tokenId);
+        if (_ownerOf(tokenId) != address(0)) revert TokenIdTaken(tokenId);
+        _mint(to, tokenId);
+        emit Minted(tokenId, to, address(0), ETH, 0);
     }
 
     // ===== recarga de créditos =====
@@ -267,6 +287,11 @@ contract BotInstanceNFT is ERC721, Ownable2Step, ReentrancyGuard {
         partnerMintShareBps[partner] = mintShareBps;
         partnerTopUpShareBps[partner] = topUpShareBps;
         emit PartnerSharesSet(partner, mintShareBps, topUpShareBps);
+    }
+
+    function setMinter(address newMinter) external onlyOwner {
+        minter = newMinter;
+        emit MinterSet(newMinter);
     }
 
     function setTransferGuard(ITransferGuard guard) external onlyOwner {

@@ -9,7 +9,7 @@ import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {BotInstanceNFT} from "../src/BotInstanceNFT.sol";
 import {TradeExecutor} from "../src/TradeExecutor.sol";
 import {UniswapV4Adapter, PoolKey, IPoolManagerLike} from "../src/UniswapV4Adapter.sol";
-import {Token} from "./TradeExecutor.t.sol";
+import {Token} from "./Mocks.sol";
 
 contract MockWETH is ERC20 {
     constructor() ERC20("WETH", "WETH") {}
@@ -346,21 +346,18 @@ contract UniswapV4AdapterTest is Test {
     /// Executor com o adaptador aprovado como destino, e uma instância pronta.
     function _setUpExecutor() internal {
         BotInstanceNFT nft = new BotInstanceNFT(multisig, treasury, 1_000, 0);
-        executor = new TradeExecutor(multisig, IERC721(address(nft)), operator, treasury, 1_000, 1_000);
+        executor = new TradeExecutor(multisig, IERC721(address(nft)), address(weth), operator, treasury, 50);
         vm.startPrank(multisig);
-        nft.setTransferGuard(executor);
         executor.setAggregator(address(adapter), true);
         executor.setQuoteToken(address(usdg), true);
         vm.stopPrank();
 
-        usdg.mint(alice, 10_000e18);
         vm.startPrank(alice);
         aliceId = nft.mint(address(0));
-        executor.setLimits(aliceId, 10_000e18, false);
+        executor.setLimits(aliceId, 10_000e18, false, false);
         executor.setMarketAllowed(aliceId, executor.pairKey(address(nvda), address(usdg)), true);
-        usdg.approve(address(executor), type(uint256).max);
-        nvda.approve(address(executor), type(uint256).max);
         vm.stopPrank();
+        usdg.mint(executor.vaultOf(aliceId), 10_000e18);
     }
 
     /// Rota pelo adaptador, com a saída voltando ao executor.
@@ -382,28 +379,36 @@ contract UniswapV4AdapterTest is Test {
         list[0] = value;
     }
 
-    /// O caminho inteiro: o executor puxa a cotação do dono, usa o adaptador
-    /// como destino do caminho do agregador e devolve o ativo ao dono.
+    /// O caminho inteiro: o executor tira a cotação do cofre, usa o
+    /// adaptador como destino do caminho do agregador e põe o ativo no cofre.
     function test_executorTradesAV4PoolThroughTheAdapter() public {
         _setUpExecutor();
+        address vault = executor.vaultOf(aliceId);
         PoolKey memory pool = _pool(address(nvda), address(usdg), 2, address(0));
         TradeExecutor.Pair memory pair = TradeExecutor.Pair(address(nvda), address(usdg));
 
-        // Entra a 2.
+        // Entra a 2: 1000 menos 0,5% de taxa = 995 trocados.
         vm.prank(operator);
         executor.openViaAggregator(
-            _one(aliceId), pair, _one(1_000e18), 500e18, block.timestamp, _v4Route(pool, usdg, nvda, 1_000e18)
+            _one(aliceId),
+            pair,
+            _one(1_000e18),
+            497.5e18,
+            50,
+            block.timestamp,
+            bytes32(0),
+            _v4Route(pool, usdg, nvda, 995e18)
         );
-        assertEq(nvda.balanceOf(alice), 500e18);
+        assertEq(nvda.balanceOf(vault), 497.5e18);
 
-        // Sai a 3: lucro 500, taxa de 10%.
+        // Sai a 3: 1492,5, menos 0,5%.
         _pool(address(nvda), address(usdg), 3, address(0));
         vm.prank(operator);
         executor.closeViaAggregator(
-            _one(aliceId), pair, new address[](1), 1_500e18, block.timestamp, _v4Route(pool, nvda, usdg, 500e18)
+            _one(aliceId), pair, 1_492.5e18, 50, block.timestamp, bytes32(0), _v4Route(pool, nvda, usdg, 497.5e18)
         );
-        assertEq(usdg.balanceOf(alice), 10_000e18 + 450e18);
-        assertEq(executor.claimable(treasury, address(usdg)), 50e18);
+        assertEq(usdg.balanceOf(vault), 9_000e18 + 1_492.5e18 - 7.4625e18);
+        assertEq(executor.claimable(treasury, address(usdg)), 5e18 + 7.4625e18);
         assertEq(usdg.balanceOf(address(adapter)), 0);
         assertEq(usdg.allowance(address(executor), address(adapter)), 0);
     }

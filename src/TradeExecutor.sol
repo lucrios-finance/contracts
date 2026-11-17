@@ -3,6 +3,7 @@ pragma solidity 0.8.28;
 
 import {Ownable, Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {Clones} from "@openzeppelin/contracts/proxy/Clones.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {IERC721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
@@ -10,42 +11,50 @@ import {IUniswapV3Pool} from "@uniswap/v3-core/contracts/interfaces/IUniswapV3Po
 import {IUniswapV3SwapCallback} from "@uniswap/v3-core/contracts/interfaces/callback/IUniswapV3SwapCallback.sol";
 import {TickMath} from "@uniswap/v3-core/contracts/libraries/TickMath.sol";
 import {FullMath} from "@uniswap/v3-core/contracts/libraries/FullMath.sol";
-import {ITransferGuard} from "./BotInstanceNFT.sol";
+import {InstanceVault} from "./InstanceVault.sol";
+import {IV3PositionAdapter} from "./V3PositionAdapters.sol";
+
+interface IWETH {
+    function deposit() external payable;
+}
 
 /// Executa os trades das instâncias.
 ///
-/// Modelo de custódia: os fundos ficam na carteira do dono do NFT, que dá
-/// allowance do token de cotação e de cada ativo a este contrato. Para abrir,
-/// o contrato puxa a cotação do dono, troca no pool e devolve o ativo ao dono.
-/// Para fechar, puxa o ativo, troca, desconta as taxas e devolve a cotação.
-/// Entre uma chamada e outra o contrato só guarda as taxas ainda não sacadas.
+/// Modelo de custódia: cada instância (NFT) tem um cofre (`InstanceVault`)
+/// com o que é dela. Para abrir, este contrato tira a cotação do cofre, troca
+/// e põe o ativo no cofre; para fechar, o inverso. A faixa de liquidez (ordem
+/// limite, LP) nasce com o cofre como dono do NFT. Entre uma chamada e outra
+/// este contrato só guarda as taxas ainda não sacadas. O dono do NFT saca do
+/// cofre a qualquer momento, sem passar por aqui.
 ///
-/// Só a carteira operadora inicia trades. O que uma operadora comprometida
-/// consegue fazer é limitado aqui, não no backend:
-///  - o resultado de um trade só vai para o dono da instância;
-///  - só mercados cadastrados pelo multisig e liberados pelo dono;
+/// Só a carteira operadora (o assinador do backend) inicia trades. Ela decide;
+/// este contrato limita e registra. O que uma operadora comprometida consegue
+/// fazer é limitado aqui, não no backend:
+///  - o resultado de um trade só vai para o cofre da instância;
+///  - só mercados liberados pelo dono (um a um, ou todos com `anyMarket`);
 ///  - valor por trade limitado pelo dono, que também pode pausar;
-///  - preço executado preso ao preço médio do pool (TWAP), dentro de uma
-///    tolerância por mercado.
+///  - no pool direto, preço executado preso ao preço médio do pool (TWAP);
+///  - no agregador, aprovação exata a destinos aprovados pelo multisig e
+///    medição do que voltou, com o preço médio de um pool de referência
+///    quando o par tem um;
+///  - faixas de liquidez só em pools da factory cadastrada para o
+///    gerenciador, com o cofre como dono do NFT;
+///  - taxa nunca acima de `volumeFeeBps`, que o multisig limita a
+///    `MAX_VOLUME_FEE_BPS`;
+///  - um trade que perde mais que `lossPauseBps` do custo pausa a instância.
 ///
-/// Há dois caminhos de execução. No pool direto, este contrato fala com um
-/// pool do Uniswap v3 cadastrado. Pelo agregador, ele entrega a entrada a um
-/// contrato de roteamento aprovado pelo multisig, com a rota montada fora da
-/// chain, e só confere quanto voltou — é o que permite negociar tokens sem
-/// pool cadastrado. Nesse caminho a trava de preço médio só existe para os
-/// pares que têm um pool de referência; para os demais valem o mínimo pedido
-/// pela operadora, os limites do dono e a pausa automática por perda (ver
-/// `lossPauseBps`), que limita o dano de uma operadora comprometida a um
-/// trade por par liberado.
+/// Cada trade emite um evento com o `decision` que a operadora informou: o
+/// hash do registro da decisão do agente, publicado fora da chain. É o que
+/// liga o que o agente decidiu ao que foi executado.
 ///
-/// Não é atualizável: um contrato com allowance de usuários não deve poder
-/// mudar de código. Versão nova = contrato novo e novo approve.
-contract TradeExecutor is Ownable2Step, ReentrancyGuard, ITransferGuard, IUniswapV3SwapCallback {
+/// Não é atualizável: um contrato que move os fundos dos cofres não deve
+/// poder mudar de código. Versão nova = contrato novo e cofres novos.
+contract TradeExecutor is Ownable2Step, ReentrancyGuard, IUniswapV3SwapCallback {
     using SafeERC20 for IERC20;
 
     uint256 public constant BPS = 10_000;
-    /// Teto da soma das taxas de lucro (protocolo + líder).
-    uint256 public constant MAX_TOTAL_FEE_BPS = 3_000;
+    /// Teto da taxa de volume: 1%.
+    uint16 public constant MAX_VOLUME_FEE_BPS = 100;
     uint256 public constant MAX_DEVIATION_BPS = 1_000;
 
     struct Market {
@@ -64,27 +73,17 @@ contract TradeExecutor is Ownable2Step, ReentrancyGuard, ITransferGuard, IUniswa
     struct Limits {
         uint256 maxPerTrade;
         bool paused;
+        /// Libera todos os mercados: os pools cadastrados e qualquer par cuja
+        /// cotação o multisig aceita. É o que as habilidades que caçam pools
+        /// novos precisam, já que o pool não existe quando o dono configura.
+        bool anyMarket;
     }
 
     struct Position {
-        /// Ativo comprado, na carteira do dono.
+        /// Ativo comprado, no cofre.
         uint256 base;
-        /// Cotação gasta para comprar.
+        /// Cotação gasta para comprar, com a taxa.
         uint256 cost;
-    }
-
-    /// Resultado acumulado de uma instância num token de cotação. A taxa de
-    /// lucro só incide sobre o que passa do pico.
-    struct Pnl {
-        int256 cumulative;
-        int256 highWaterMark;
-    }
-
-    /// Instância que esta segue, e a taxa do líder vigente quando começou a
-    /// seguir — mudança posterior da taxa não alcança quem já seguia.
-    struct Follow {
-        uint256 leader;
-        uint16 feeBps;
     }
 
     /// Um par negociado pelo agregador. A chave dele (ver `pairKey`) ocupa o
@@ -101,74 +100,158 @@ contract TradeExecutor is Ownable2Step, ReentrancyGuard, ITransferGuard, IUniswa
         bytes data;
     }
 
+    /// Um gerenciador de posições (NFT) de um fork do Uniswap V3.
+    struct PositionVenue {
+        /// De onde os pools desse gerenciador vêm.
+        address factory;
+        /// Como montar as chamadas desse fork.
+        IV3PositionAdapter adapter;
+        /// Desabilitar impede faixas novas; as abertas continuam saindo.
+        bool enabled;
+        /// Faixas aqui não pagam taxa (parceria com o AMM).
+        bool feeExempt;
+        /// Janela do preço médio, em segundos. 0 = sem trava de preço, só
+        /// para AMM cujos pools não guardam histórico.
+        uint32 twapWindow;
+        /// Quantos ticks o preço atual pode estar longe do médio para abrir
+        /// ou fechar uma faixa (100 ticks ≈ 1%).
+        uint24 maxTickDeviation;
+    }
+
+    /// Uma faixa aberta, cujo NFT está no cofre.
+    struct Range {
+        address manager;
+        address pool;
+        address base;
+        address quote;
+        uint128 liquidity;
+    }
+
+    /// Os parâmetros de uma faixa nova.
+    struct RangeOpen {
+        uint256 tokenId;
+        address manager;
+        address pool;
+        /// Qual dos dois tokens do pool é a cotação (a taxa é contada nele).
+        address quote;
+        int24 tickLower;
+        int24 tickUpper;
+        uint256 amount0;
+        uint256 amount1;
+        uint256 amount0Min;
+        uint256 amount1Min;
+        uint16 feeBps;
+        uint256 deadline;
+        bytes32 decision;
+    }
+
+    /// Os parâmetros do fechamento de uma faixa.
+    struct RangeClose {
+        uint256 tokenId;
+        uint256 nftId;
+        uint256 amount0Min;
+        uint256 amount1Min;
+        uint16 feeBps;
+        uint256 deadline;
+        bytes32 decision;
+    }
+
     IERC721 public immutable nft;
+    address public immutable weth;
+    address public immutable vaultImplementation;
 
     address public operator;
     address public treasury;
-    /// Taxa do protocolo sobre o lucro acima do pico.
-    uint16 public profitFeeBps;
-    /// Taxa do líder de copy trade sobre o lucro acima do pico do seguidor.
-    uint16 public leaderFeeBps;
+    /// Taxa máxima por trade, sobre a cotação que entra ou sai. A operadora
+    /// informa a de cada trade (zero nos AMMs parceiros), nunca acima desta.
+    uint16 public volumeFeeBps;
+    /// Perda num único trade, em pontos-base do custo, a partir da qual a
+    /// instância é pausada sozinha. 0 = desligado.
+    uint16 public lossPauseBps;
 
     mapping(address pool => Market) public markets;
     mapping(uint256 tokenId => Limits) public limits;
-    mapping(uint256 tokenId => mapping(address pool => bool)) public marketAllowed;
-    mapping(uint256 tokenId => mapping(address pool => Position)) public positions;
-    mapping(uint256 tokenId => uint256) public openCount;
-    mapping(uint256 tokenId => mapping(address quote => Pnl)) public pnl;
-    mapping(uint256 tokenId => Follow) public following;
+    mapping(uint256 tokenId => mapping(address market => bool)) public marketAllowed;
+    mapping(uint256 tokenId => mapping(address market => Position)) public positions;
+    mapping(uint256 tokenId => mapping(uint256 nftId => Range)) public ranges;
+    /// Instâncias que não pagam taxa (as da casa, as da whitelist).
+    mapping(uint256 tokenId => bool) public feeExempt;
 
-    /// Pontos do lucro repassados a cada parceiro, saídos da taxa do
-    /// protocolo. Endereço fora do mapa não recebe nada.
-    mapping(address partner => uint16) public partnerProfitShareBps;
     /// Taxas acumuladas e ainda não sacadas, por beneficiário e por token.
     mapping(address account => mapping(address token => uint256)) public claimable;
 
     /// Contratos de roteamento que podem receber a entrada de um swap.
     mapping(address target => bool) public aggregators;
-    /// Tokens aceitos como cotação no caminho do agregador. As taxas e o
-    /// resultado acumulado são contados no token de cotação.
+    /// Tokens aceitos como cotação no agregador e nas faixas.
     mapping(address token => bool) public quoteTokens;
     /// Par de cada chave já usada.
     mapping(address key => Pair) public pairs;
     /// Pool cadastrado cujo preço médio também limita os swaps do par pelo
     /// agregador. `address(0)` = par sem referência de preço.
     mapping(address key => address) public referencePool;
-    /// Perda num único trade, em pontos-base do custo, a partir da qual a
-    /// instância é pausada sozinha. 0 = desligado.
-    uint16 public lossPauseBps;
+    mapping(address manager => PositionVenue) public positionVenues;
 
     /// Pool com swap em andamento; só ele pode chamar o callback.
     address private _activePool;
 
-    event PositionOpened(uint256 indexed tokenId, address indexed pool, uint256 quoteIn, uint256 baseOut);
+    event VaultCreated(uint256 indexed tokenId, address vault);
+    event PositionOpened(
+        uint256 indexed tokenId, address indexed market, uint256 quoteIn, uint256 fee, uint256 baseOut, bytes32 decision
+    );
     event PositionClosed(
         uint256 indexed tokenId,
-        address indexed pool,
+        address indexed market,
         uint256 baseIn,
         uint256 quoteOut,
+        uint256 fee,
         int256 pnl,
-        uint256 protocolFee,
-        uint256 partnerFee,
-        uint256 leaderFee,
-        address feeRecipient
+        bytes32 decision
     );
-    event PositionAbandoned(uint256 indexed tokenId, address indexed pool, uint256 base, uint256 cost);
-    event LimitsSet(uint256 indexed tokenId, uint256 maxPerTrade, bool paused);
-    event MarketAllowedSet(uint256 indexed tokenId, address indexed pool, bool allowed);
-    event Followed(uint256 indexed tokenId, uint256 indexed leader, uint16 feeBps);
-    event Unfollowed(uint256 indexed tokenId);
+    event PositionDropped(uint256 indexed tokenId, address indexed market, uint256 base, uint256 cost);
+    event RangeOpened(
+        uint256 indexed tokenId,
+        address indexed manager,
+        uint256 indexed nftId,
+        address pool,
+        uint128 liquidity,
+        uint256 amount0,
+        uint256 amount1,
+        uint256 fee,
+        bytes32 decision
+    );
+    event RangeClosed(
+        uint256 indexed tokenId,
+        address indexed manager,
+        uint256 indexed nftId,
+        uint256 baseOut,
+        uint256 quoteOut,
+        uint256 fee,
+        bytes32 decision
+    );
+    event RangeDropped(uint256 indexed tokenId, address indexed manager, uint256 indexed nftId);
+    event Wrapped(uint256 indexed tokenId, uint256 amount);
+    event LimitsSet(uint256 indexed tokenId, uint256 maxPerTrade, bool paused, bool anyMarket);
+    event MarketAllowedSet(uint256 indexed tokenId, address indexed market, bool allowed);
+    event FeeExemptSet(uint256 indexed tokenId, bool exempt);
     event Withdrawn(address indexed account, address indexed token, uint256 amount);
     event MarketSet(
         address indexed pool, address base, address quote, bool enabled, uint32 twapWindow, uint16 maxDeviationBps
     );
     event OperatorSet(address operator);
     event TreasurySet(address treasury);
-    event FeesSet(uint16 profitFeeBps, uint16 leaderFeeBps);
-    event PartnerProfitShareSet(address indexed partner, uint16 shareBps);
+    event VolumeFeeSet(uint16 volumeFeeBps);
     event AggregatorSet(address indexed target, bool allowed);
     event QuoteTokenSet(address indexed token, bool allowed);
     event PairReferenceSet(address indexed key, address indexed pool);
+    event PositionVenueSet(
+        address indexed manager,
+        address factory,
+        address adapter,
+        bool enabled,
+        bool feeExempt,
+        uint32 twapWindow,
+        uint24 maxTickDeviation
+    );
     event LossPauseSet(uint16 lossPauseBps);
     event InstanceAutoPaused(uint256 indexed tokenId, address indexed market, uint256 cost, uint256 proceeds);
 
@@ -178,27 +261,31 @@ contract TradeExecutor is Ownable2Step, ReentrancyGuard, ITransferGuard, IUniswa
     error LengthMismatch();
     error EmptyBatch();
     error MarketDisabled(address pool);
-    error MarketNotAllowed(uint256 tokenId, address pool);
+    error MarketNotAllowed(uint256 tokenId, address market);
     error InstancePaused(uint256 tokenId);
     error OverTradeLimit(uint256 tokenId, uint256 amount, uint256 maxPerTrade);
     error ZeroAmount();
-    error PositionExists(uint256 tokenId, address pool);
-    error NoPosition(uint256 tokenId, address pool);
+    error PositionExists(uint256 tokenId, address market);
+    error NoPosition(uint256 tokenId, address market);
+    error PositionStillHeld(uint256 tokenId, address market);
     error InsufficientOutput(uint256 out, uint256 minOut);
     error PriceDeviation(uint256 out, uint256 expectedAtTwap);
     error SwapNotFilled();
     error BadCallback();
     error InvalidMarket();
-    error InvalidFees();
+    error FeeTooHigh(uint16 feeBps, uint16 maxBps);
     error ZeroAddress();
     error NothingToWithdraw();
-    error HasOpenPositions(uint256 tokenId);
-    error InvalidLeader(uint256 leader);
-    error PositionStillClosable(uint256 tokenId, address pool);
     error AggregatorNotAllowed(address target);
     error QuoteTokenNotAllowed(address token);
     error InvalidPair();
     error AggregatorCallFailed();
+    error VenueDisabled(address manager);
+    error InvalidRange();
+    error NoRange(uint256 tokenId, uint256 nftId);
+    error RangeStillHeld(uint256 tokenId, uint256 nftId);
+    error RangeNotInVault(uint256 nftId);
+    error RangePriceDeviation(int24 spot, int24 mean);
 
     modifier onlyOperator() {
         if (msg.sender != operator) revert NotOperator();
@@ -213,339 +300,494 @@ contract TradeExecutor is Ownable2Step, ReentrancyGuard, ITransferGuard, IUniswa
     constructor(
         address initialOwner,
         IERC721 nft_,
+        address weth_,
         address operator_,
         address treasury_,
-        uint16 profitFeeBps_,
-        uint16 leaderFeeBps_
+        uint16 volumeFeeBps_
     ) Ownable(initialOwner) {
-        if (address(nft_) == address(0) || treasury_ == address(0)) revert ZeroAddress();
-        if (uint256(profitFeeBps_) + leaderFeeBps_ > MAX_TOTAL_FEE_BPS) revert InvalidFees();
+        if (address(nft_) == address(0) || weth_ == address(0) || treasury_ == address(0)) {
+            revert ZeroAddress();
+        }
+        if (volumeFeeBps_ > MAX_VOLUME_FEE_BPS) revert FeeTooHigh(volumeFeeBps_, MAX_VOLUME_FEE_BPS);
         nft = nft_;
+        weth = weth_;
+        vaultImplementation = address(new InstanceVault());
         operator = operator_;
         treasury = treasury_;
-        profitFeeBps = profitFeeBps_;
-        leaderFeeBps = leaderFeeBps_;
+        volumeFeeBps = volumeFeeBps_;
 
         emit OperatorSet(operator_);
         emit TreasurySet(treasury_);
-        emit FeesSet(profitFeeBps_, leaderFeeBps_);
+        emit VolumeFeeSet(volumeFeeBps_);
     }
 
-    // ===== trava de transferência do NFT =====
+    // ===== cofres =====
 
-    function isLocked(uint256 tokenId) external view returns (bool) {
-        return openCount[tokenId] > 0;
+    /// O endereço do cofre de uma instância, exista ele ou não. Dá para
+    /// depositar nele antes de ele ser criado.
+    function vaultOf(uint256 tokenId) public view returns (address) {
+        return Clones.predictDeterministicAddress(vaultImplementation, bytes32(tokenId));
+    }
+
+    /// Cria o cofre. Qualquer um pode chamar; o executor também cria no
+    /// primeiro trade.
+    function createVault(uint256 tokenId) external returns (address) {
+        return address(_vault(tokenId));
+    }
+
+    function _vault(uint256 tokenId) private returns (InstanceVault vault) {
+        vault = InstanceVault(payable(vaultOf(tokenId)));
+        if (address(vault).code.length == 0) {
+            Clones.cloneDeterministic(vaultImplementation, bytes32(tokenId));
+            vault.initialize(nft, tokenId);
+            emit VaultCreated(tokenId, address(vault));
+        }
+    }
+
+    /// Embrulha o ETH do cofre em WETH, para a instância poder operar com
+    /// ele. Depositar ETH puro no cofre é o caminho mais simples para o dono.
+    function wrapNative(uint256 tokenId) external onlyOperator nonReentrant {
+        InstanceVault vault = _vault(tokenId);
+        uint256 amount = address(vault).balance;
+        if (amount == 0) revert ZeroAmount();
+        vault.execute(weth, amount, abi.encodeCall(IWETH.deposit, ()));
+        emit Wrapped(tokenId, amount);
     }
 
     // ===== dono da instância =====
 
-    function setLimits(uint256 tokenId, uint256 maxPerTrade, bool paused) external onlyInstanceOwner(tokenId) {
-        limits[tokenId] = Limits({maxPerTrade: maxPerTrade, paused: paused});
-        emit LimitsSet(tokenId, maxPerTrade, paused);
+    function setLimits(uint256 tokenId, uint256 maxPerTrade, bool paused, bool anyMarket)
+        external
+        onlyInstanceOwner(tokenId)
+    {
+        limits[tokenId] = Limits({maxPerTrade: maxPerTrade, paused: paused, anyMarket: anyMarket});
+        emit LimitsSet(tokenId, maxPerTrade, paused, anyMarket);
     }
 
-    function setMarketAllowed(uint256 tokenId, address pool, bool allowed) external onlyInstanceOwner(tokenId) {
-        marketAllowed[tokenId][pool] = allowed;
-        emit MarketAllowedSet(tokenId, pool, allowed);
+    function setMarketAllowed(uint256 tokenId, address market, bool allowed) external onlyInstanceOwner(tokenId) {
+        marketAllowed[tokenId][market] = allowed;
+        emit MarketAllowedSet(tokenId, market, allowed);
     }
 
-    /// Passa a seguir um líder: a instância entra nos trades em lote dele e
-    /// paga a taxa de líder sobre o próprio lucro. Só sem posição aberta —
-    /// senão daria para trocar de líder (ou deixar de seguir) entre a compra
-    /// e a venda e escapar da taxa.
-    function follow(uint256 tokenId, uint256 leader) external onlyInstanceOwner(tokenId) {
-        if (openCount[tokenId] > 0) revert HasOpenPositions(tokenId);
-        if (leader == tokenId || leader == 0) revert InvalidLeader(leader);
-        // ownerOf reverte se o líder não existe.
-        nft.ownerOf(leader);
-
-        uint16 feeBps = leaderFeeBps;
-        following[tokenId] = Follow({leader: leader, feeBps: feeBps});
-        emit Followed(tokenId, leader, feeBps);
-    }
-
-    function unfollow(uint256 tokenId) external onlyInstanceOwner(tokenId) {
-        if (openCount[tokenId] > 0) revert HasOpenPositions(tokenId);
-        delete following[tokenId];
-        emit Unfollowed(tokenId);
-    }
-
-    /// Descarta o registro de uma posição sem vender: o ativo já está na
-    /// carteira do dono, que passa a cuidar dele por conta própria. Não gera
-    /// taxa nem mexe no resultado acumulado.
+    /// Esquece uma posição sem vender: o ativo continua no cofre, e o dono
+    /// passa a cuidar dele. Não gera taxa.
     ///
-    /// O dono pode chamar sempre. A operadora só quando o fechamento normal é
-    /// impossível (o dono moveu o ativo ou tirou o allowance) — do contrário
-    /// ela poderia apagar posições lucrativas para o protocolo não cobrar.
-    function abandonPosition(uint256 tokenId, address pool) external {
-        Position memory position = positions[tokenId][pool];
-        if (position.base == 0) revert NoPosition(tokenId, pool);
-
-        address instanceOwner = nft.ownerOf(tokenId);
-        if (msg.sender != instanceOwner) {
+    /// O dono pode chamar sempre. A operadora só quando o ativo não está mais
+    /// no cofre (o dono sacou) — do contrário ela poderia esquecer posições
+    /// para o protocolo não cobrar a saída.
+    function dropPosition(uint256 tokenId, address market) external {
+        Position memory position = positions[tokenId][market];
+        if (position.base == 0) revert NoPosition(tokenId, market);
+        if (msg.sender != nft.ownerOf(tokenId)) {
             if (msg.sender != operator) revert NotInstanceOwner(tokenId);
-            IERC20 base = IERC20(_baseOf(pool));
-            bool closable = base.balanceOf(instanceOwner) >= position.base
-                && base.allowance(instanceOwner, address(this)) >= position.base;
-            if (closable) revert PositionStillClosable(tokenId, pool);
+            if (IERC20(_baseOf(market)).balanceOf(vaultOf(tokenId)) != 0) revert PositionStillHeld(tokenId, market);
         }
+        delete positions[tokenId][market];
+        emit PositionDropped(tokenId, market, position.base, position.cost);
+    }
 
-        delete positions[tokenId][pool];
-        openCount[tokenId]--;
-        emit PositionAbandoned(tokenId, pool, position.base, position.cost);
+    /// Esquece uma faixa. O dono pode sempre (e saca o NFT do cofre para
+    /// cuidar dela); a operadora só quando o NFT não está mais no cofre.
+    function dropRange(uint256 tokenId, uint256 nftId) external {
+        Range memory range = ranges[tokenId][nftId];
+        if (range.manager == address(0)) revert NoRange(tokenId, nftId);
+        if (msg.sender != nft.ownerOf(tokenId)) {
+            if (msg.sender != operator) revert NotInstanceOwner(tokenId);
+            if (_holdsNft(range.manager, nftId, vaultOf(tokenId))) revert RangeStillHeld(tokenId, nftId);
+        }
+        delete ranges[tokenId][nftId];
+        emit RangeDropped(tokenId, range.manager, nftId);
+    }
+
+    function _holdsNft(address collection, uint256 id, address holder) private view returns (bool) {
+        try IERC721(collection).ownerOf(id) returns (address current) {
+            return current == holder;
+        } catch {
+            return false;
+        }
     }
 
     // ===== operadora: abrir =====
 
-    /// Um swap em lote: o que entrou no pool e o que saiu, a dividir entre as
+    /// Um swap em lote: o que entrou e o que saiu, a dividir entre as
     /// instâncias na proporção do que cada uma pôs.
     struct Batch {
-        address pool;
+        address market;
+        address tokenIn;
         address tokenOut;
         uint256 amountIn;
         uint256 amountOut;
+        uint16 feeBps;
+        bytes32 decision;
     }
 
-    /// Abre posição para uma ou mais instâncias no mesmo swap. Com várias, é
-    /// o copy trade: líder e seguidores entram ao mesmo preço médio, e o
-    /// ativo comprado é dividido na proporção do que cada um pôs.
+    /// O que cada instância pôs num lote.
+    struct Shares {
+        InstanceVault[] vaults;
+        /// Abrir: cotação tirada do cofre, com a taxa. Fechar: ativo vendido.
+        uint256[] gross;
+        /// Abrir: a taxa de cada uma. Fechar: não usado.
+        uint256[] fees;
+    }
+
+    /// Abre posição para uma ou mais instâncias no mesmo swap, direto num
+    /// pool cadastrado. Com várias, é o copy trade: todos entram ao mesmo
+    /// preço médio, e o ativo comprado é dividido na proporção do que cada um
+    /// pôs (já sem a taxa).
     function openPositions(
         uint256[] calldata tokenIds,
         address pool,
         uint256[] calldata quoteIns,
         uint256 minBaseOut,
-        uint256 deadline
+        uint16 feeBps,
+        uint256 deadline,
+        bytes32 decision
     ) external onlyOperator nonReentrant {
-        if (block.timestamp > deadline) revert Expired();
-        if (tokenIds.length == 0) revert EmptyBatch();
-        if (quoteIns.length != tokenIds.length) revert LengthMismatch();
-
+        _checkBatch(tokenIds.length, quoteIns.length, deadline, feeBps);
         Market memory market = markets[pool];
         if (!market.enabled) revert MarketDisabled(pool);
 
-        Batch memory batch = Batch(pool, market.base, 0, 0);
-        address[] memory owners;
-        uint256[] memory paid;
-        (owners, paid, batch.amountIn) = _pullQuotes(tokenIds, pool, quoteIns, market.quote);
+        Batch memory batch = Batch(pool, market.quote, market.base, 0, 0, feeBps, decision);
+        Shares memory shares = _takeQuotes(tokenIds, quoteIns, batch);
         batch.amountOut = _swapChecked(pool, market, market.quote, market.base, batch.amountIn, minBaseOut);
-
-        _recordPositions(tokenIds, owners, paid, batch);
+        _recordPositions(tokenIds, shares, batch);
     }
 
-    /// Confere os limites de cada instância e puxa a cotação de cada dono.
-    function _pullQuotes(uint256[] calldata tokenIds, address pool, uint256[] calldata quoteIns, address quote)
+    /// Abre posição trocando pelo agregador. Mesmas travas de entrada do pool
+    /// direto; a diferença é de onde vem o preço.
+    function openViaAggregator(
+        uint256[] calldata tokenIds,
+        Pair calldata pair,
+        uint256[] calldata quoteIns,
+        uint256 minBaseOut,
+        uint16 feeBps,
+        uint256 deadline,
+        bytes32 decision,
+        Route calldata route
+    ) external onlyOperator nonReentrant {
+        _checkBatch(tokenIds.length, quoteIns.length, deadline, feeBps);
+        if (!quoteTokens[pair.quote]) revert QuoteTokenNotAllowed(pair.quote);
+
+        address key = _usePair(pair);
+        Batch memory batch = Batch(key, pair.quote, pair.base, 0, 0, feeBps, decision);
+        Shares memory shares = _takeQuotes(tokenIds, quoteIns, batch);
+        batch.amountOut = _aggregatorSwap(key, route, pair.quote, pair.base, batch.amountIn, minBaseOut);
+        _recordPositions(tokenIds, shares, batch);
+    }
+
+    function _checkBatch(uint256 count, uint256 otherCount, uint256 deadline, uint16 feeBps) private view {
+        if (block.timestamp > deadline) revert Expired();
+        if (count == 0) revert EmptyBatch();
+        if (otherCount != count) revert LengthMismatch();
+        if (feeBps > volumeFeeBps) revert FeeTooHigh(feeBps, volumeFeeBps);
+    }
+
+    /// Confere os limites de cada instância, tira a cotação do cofre e separa
+    /// a taxa. `batch.amountIn` sai com o total a trocar.
+    function _takeQuotes(uint256[] calldata tokenIds, uint256[] calldata quoteIns, Batch memory batch)
         private
-        returns (address[] memory owners, uint256[] memory paid, uint256 totalIn)
+        returns (Shares memory shares)
     {
         uint256 count = tokenIds.length;
-        owners = new address[](count);
-        paid = new uint256[](count);
+        shares = Shares(new InstanceVault[](count), new uint256[](count), new uint256[](count));
         for (uint256 i = 0; i < count; i++) {
             uint256 tokenId = tokenIds[i];
-            _checkCanOpen(tokenId, pool, quoteIns[i]);
-            owners[i] = nft.ownerOf(tokenId);
-            paid[i] = _pull(quote, owners[i], quoteIns[i]);
-            totalIn += paid[i];
+            _checkCanOpen(tokenId, batch.market, quoteIns[i]);
+            if (positions[tokenId][batch.market].base != 0) revert PositionExists(tokenId, batch.market);
+
+            shares.vaults[i] = _vault(tokenId);
+            uint256 received = _take(shares.vaults[i], batch.tokenIn, quoteIns[i]);
+            uint256 fee = _fee(tokenId, received, batch.feeBps);
+            if (fee > 0) claimable[treasury][batch.tokenIn] += fee;
+            shares.gross[i] = received;
+            shares.fees[i] = fee;
+            batch.amountIn += received - fee;
         }
     }
 
-    /// Divide o ativo comprado, envia a cada dono e registra a posição.
-    function _recordPositions(
-        uint256[] calldata tokenIds,
-        address[] memory owners,
-        uint256[] memory paid,
-        Batch memory batch
-    ) private {
+    /// Divide o ativo comprado, põe cada parte no cofre e registra a posição.
+    function _recordPositions(uint256[] calldata tokenIds, Shares memory shares, Batch memory batch) private {
         uint256 count = tokenIds.length;
         uint256 distributed;
         for (uint256 i = 0; i < count; i++) {
             // O último fica com o resto do arredondamento.
             uint256 share = i == count - 1
                 ? batch.amountOut - distributed
-                : FullMath.mulDiv(batch.amountOut, paid[i], batch.amountIn);
+                : FullMath.mulDiv(batch.amountOut, shares.gross[i] - shares.fees[i], batch.amountIn);
             distributed += share;
-            // Posição com zero de ativo não é posição: ficaria contada como
-            // aberta sem poder ser fechada nem abandonada, travando o NFT.
+            // Posição com zero de ativo não é posição: não daria para fechar.
             if (share == 0) revert ZeroAmount();
 
             uint256 tokenId = tokenIds[i];
-            positions[tokenId][batch.pool] = Position({base: share, cost: paid[i]});
-            openCount[tokenId]++;
-            IERC20(batch.tokenOut).safeTransfer(owners[i], share);
-            emit PositionOpened(tokenId, batch.pool, paid[i], share);
+            positions[tokenId][batch.market] = Position({base: share, cost: shares.gross[i]});
+            IERC20(batch.tokenOut).safeTransfer(address(shares.vaults[i]), share);
+            emit PositionOpened(tokenId, batch.market, shares.gross[i], shares.fees[i], share, batch.decision);
         }
     }
 
-    function _checkCanOpen(uint256 tokenId, address pool, uint256 quoteIn) private view {
+    function _checkCanOpen(uint256 tokenId, address market, uint256 quoteIn) private view {
         Limits memory limit = limits[tokenId];
         if (limit.paused) revert InstancePaused(tokenId);
-        if (!marketAllowed[tokenId][pool]) revert MarketNotAllowed(tokenId, pool);
+        if (!limit.anyMarket && !marketAllowed[tokenId][market]) revert MarketNotAllowed(tokenId, market);
         if (quoteIn == 0) revert ZeroAmount();
         if (quoteIn > limit.maxPerTrade) revert OverTradeLimit(tokenId, quoteIn, limit.maxPerTrade);
-        if (positions[tokenId][pool].base != 0) revert PositionExists(tokenId, pool);
     }
 
     // ===== operadora: fechar =====
 
-    /// Fecha a posição de uma ou mais instâncias no mesmo swap. A cotação
-    /// recebida é dividida na proporção do ativo de cada uma; de cada parte
-    /// saem as taxas de lucro, e o resto volta para o dono.
+    /// Fecha a posição de uma ou mais instâncias no mesmo swap, direto no
+    /// pool. A cotação recebida é dividida na proporção do ativo vendido; de
+    /// cada parte sai a taxa, e o resto volta ao cofre.
     ///
     /// Fechar não olha pausa nem limites: são travas para entrar, e um stop
-    /// precisa conseguir sair sempre.
-    ///
-    /// `feeRecipients[i]` é o parceiro da instância `i` (`address(0)` = sem
-    /// parceiro).
+    /// precisa conseguir sair sempre. Vale para mercado desabilitado também.
     function closePositions(
         uint256[] calldata tokenIds,
         address pool,
-        address[] calldata feeRecipients,
         uint256 minQuoteOut,
-        uint256 deadline
+        uint16 feeBps,
+        uint256 deadline,
+        bytes32 decision
     ) external onlyOperator nonReentrant {
-        if (block.timestamp > deadline) revert Expired();
-        if (tokenIds.length == 0) revert EmptyBatch();
-        if (feeRecipients.length != tokenIds.length) revert LengthMismatch();
-
-        // Vale para mercado desabilitado também: desabilitar impede entradas,
-        // não pode prender quem já está posicionado.
+        _checkBatch(tokenIds.length, tokenIds.length, deadline, feeBps);
         Market memory market = markets[pool];
         if (market.base == address(0)) revert InvalidMarket();
 
-        Batch memory batch = Batch(pool, market.quote, 0, 0);
-        address[] memory owners;
-        uint256[] memory sold;
-        (owners, sold, batch.amountIn) = _pullPositions(tokenIds, pool, market.base);
+        Batch memory batch = Batch(pool, market.base, market.quote, 0, 0, feeBps, decision);
+        Shares memory shares = _takePositions(tokenIds, batch);
         batch.amountOut = _swapChecked(pool, market, market.base, market.quote, batch.amountIn, minQuoteOut);
-
-        _settleAll(tokenIds, feeRecipients, owners, sold, batch);
+        _settleAll(tokenIds, shares, batch);
     }
 
-    /// Puxa de cada dono o ativo da posição dele.
-    function _pullPositions(uint256[] calldata tokenIds, address pool, address base)
-        private
-        returns (address[] memory owners, uint256[] memory sold, uint256 totalBase)
-    {
+    /// Fecha trocando pelo agregador. Não olha pausa, limites nem a lista de
+    /// tokens de cotação: quem está posicionado precisa conseguir sair.
+    function closeViaAggregator(
+        uint256[] calldata tokenIds,
+        Pair calldata pair,
+        uint256 minQuoteOut,
+        uint16 feeBps,
+        uint256 deadline,
+        bytes32 decision,
+        Route calldata route
+    ) external onlyOperator nonReentrant {
+        _checkBatch(tokenIds.length, tokenIds.length, deadline, feeBps);
+        address key = pairKey(pair.base, pair.quote);
+        if (pairs[key].base == address(0)) revert InvalidPair();
+
+        Batch memory batch = Batch(key, pair.base, pair.quote, 0, 0, feeBps, decision);
+        Shares memory shares = _takePositions(tokenIds, batch);
+        batch.amountOut = _aggregatorSwap(key, route, pair.base, pair.quote, batch.amountIn, minQuoteOut);
+        _settleAll(tokenIds, shares, batch);
+    }
+
+    /// Tira de cada cofre o ativo da posição. Se o dono sacou parte, vende o
+    /// que sobrou; se sacou tudo, a operadora precisa esquecer a posição
+    /// (`dropPosition`) antes.
+    function _takePositions(uint256[] calldata tokenIds, Batch memory batch) private returns (Shares memory shares) {
         uint256 count = tokenIds.length;
-        owners = new address[](count);
-        sold = new uint256[](count);
+        shares = Shares(new InstanceVault[](count), new uint256[](count), new uint256[](0));
         for (uint256 i = 0; i < count; i++) {
             uint256 tokenId = tokenIds[i];
-            uint256 amount = positions[tokenId][pool].base;
-            if (amount == 0) revert NoPosition(tokenId, pool);
-            owners[i] = nft.ownerOf(tokenId);
-            sold[i] = _pull(base, owners[i], amount);
-            totalBase += sold[i];
+            uint256 amount = positions[tokenId][batch.market].base;
+            if (amount == 0) revert NoPosition(tokenId, batch.market);
+
+            shares.vaults[i] = _vault(tokenId);
+            uint256 held = IERC20(batch.tokenIn).balanceOf(address(shares.vaults[i]));
+            if (held < amount) amount = held;
+            if (amount == 0) revert NoPosition(tokenId, batch.market);
+
+            shares.gross[i] = _take(shares.vaults[i], batch.tokenIn, amount);
+            batch.amountIn += shares.gross[i];
         }
     }
 
-    function _settleAll(
-        uint256[] calldata tokenIds,
-        address[] calldata feeRecipients,
-        address[] memory owners,
-        uint256[] memory sold,
-        Batch memory batch
-    ) private {
+    function _settleAll(uint256[] calldata tokenIds, Shares memory shares, Batch memory batch) private {
         uint256 count = tokenIds.length;
         uint256 distributed;
         for (uint256 i = 0; i < count; i++) {
             // O último fica com o resto do arredondamento.
-            uint256 share = i == count - 1
+            uint256 proceeds = i == count - 1
                 ? batch.amountOut - distributed
-                : FullMath.mulDiv(batch.amountOut, sold[i], batch.amountIn);
-            distributed += share;
-            _settle(Settlement(tokenIds[i], batch.pool, batch.tokenOut, owners[i], sold[i], share, feeRecipients[i]));
+                : FullMath.mulDiv(batch.amountOut, shares.gross[i], batch.amountIn);
+            distributed += proceeds;
+            _settle(tokenIds[i], shares.vaults[i], shares.gross[i], proceeds, batch);
         }
     }
 
-    /// A parte de uma instância num fechamento.
-    struct Settlement {
-        uint256 tokenId;
-        address pool;
-        address quote;
-        address instanceOwner;
-        uint256 baseSold;
-        uint256 proceeds;
-        address feeRecipient;
-    }
+    /// Encerra a posição de uma instância: separa a taxa e põe o resto no
+    /// cofre.
+    function _settle(uint256 tokenId, InstanceVault vault, uint256 sold, uint256 proceeds, Batch memory batch) private {
+        Position memory position = positions[tokenId][batch.market];
+        delete positions[tokenId][batch.market];
+        // Se o dono sacou parte do ativo, o custo do que foi vendido é a
+        // parte proporcional.
+        uint256 cost = sold >= position.base ? position.cost : FullMath.mulDiv(position.cost, sold, position.base);
 
-    /// Encerra a posição de uma instância: separa as taxas sobre o lucro que
-    /// passou do pico e devolve o resto ao dono.
-    function _settle(Settlement memory s) private {
-        uint256 cost = positions[s.tokenId][s.pool].cost;
-        delete positions[s.tokenId][s.pool];
-        openCount[s.tokenId]--;
+        uint256 fee = _fee(tokenId, proceeds, batch.feeBps);
+        if (fee > 0) claimable[treasury][batch.tokenOut] += fee;
+        _checkLoss(tokenId, batch.market, cost, proceeds);
 
-        int256 tradePnl = int256(s.proceeds) - int256(cost);
-        (uint256 protocolFee, uint256 partnerFee, uint256 leaderFee) = _fees(s, tradePnl);
-
-        // Perder quase tudo num trade só não é resultado de estratégia: ou o
-        // mercado quebrou, ou alguém está executando contra o dono. A
-        // instância para de abrir posição até o dono olhar e reativar.
-        if (lossPauseBps != 0 && s.proceeds * BPS < cost * (BPS - lossPauseBps)) {
-            limits[s.tokenId].paused = true;
-            emit InstanceAutoPaused(s.tokenId, s.pool, cost, s.proceeds);
-        }
-
-        if (partnerFee > 0) claimable[s.feeRecipient][s.quote] += partnerFee;
-        if (protocolFee > partnerFee) claimable[treasury][s.quote] += protocolFee - partnerFee;
-        if (leaderFee > 0) claimable[_leaderBeneficiary(following[s.tokenId].leader)][s.quote] += leaderFee;
-
-        IERC20(s.quote).safeTransfer(s.instanceOwner, s.proceeds - protocolFee - leaderFee);
-
+        IERC20(batch.tokenOut).safeTransfer(address(vault), proceeds - fee);
         emit PositionClosed(
-            s.tokenId,
-            s.pool,
-            s.baseSold,
-            s.proceeds,
-            tradePnl,
-            protocolFee - partnerFee,
-            partnerFee,
-            leaderFee,
-            s.feeRecipient
+            tokenId, batch.market, sold, proceeds, fee, int256(proceeds - fee) - int256(cost), batch.decision
         );
     }
 
-    /// Atualiza o resultado acumulado e calcula as taxas sobre o lucro novo.
-    /// `protocolFee` inclui a fatia do parceiro.
-    function _fees(Settlement memory s, int256 tradePnl)
+    /// Perder quase tudo num trade só não é resultado de estratégia: ou o
+    /// mercado quebrou, ou alguém está executando contra o dono. A instância
+    /// para de abrir posição até o dono olhar e reativar.
+    function _checkLoss(uint256 tokenId, address market, uint256 cost, uint256 proceeds) private {
+        if (lossPauseBps != 0 && proceeds * BPS < cost * (BPS - lossPauseBps)) {
+            limits[tokenId].paused = true;
+            emit InstanceAutoPaused(tokenId, market, cost, proceeds);
+        }
+    }
+
+    // ===== operadora: faixas de liquidez (ordem limite, LP) =====
+
+    /// Abre uma faixa num pool de um fork do Uniswap V3 cadastrado. O NFT da
+    /// faixa nasce no cofre. A taxa incide sobre a cotação que de fato entrou
+    /// na faixa, e é tirada do cofre à parte.
+    function openRange(RangeOpen calldata p) external onlyOperator nonReentrant returns (uint256 nftId) {
+        if (block.timestamp > p.deadline) revert Expired();
+        if (p.feeBps > volumeFeeBps) revert FeeTooHigh(p.feeBps, volumeFeeBps);
+        PositionVenue memory venue = positionVenues[p.manager];
+        if (!venue.enabled) revert VenueDisabled(p.manager);
+
+        (address token0, address token1) = venue.adapter.poolTokens(venue.factory, p.pool);
+        _checkRangePrice(venue, p.pool);
+        if (p.quote != token0 && p.quote != token1) revert InvalidRange();
+        if (!quoteTokens[p.quote]) revert QuoteTokenNotAllowed(p.quote);
+        if (p.amount0 == 0 && p.amount1 == 0) revert ZeroAmount();
+        bool quoteIs0 = p.quote == token0;
+        // O limite por trade vale para a cotação que entra. Uma faixa só de
+        // ativo (vender, por ordem limite, o que já está no cofre) não traz
+        // dinheiro novo, mas ainda exige a instância ativa e o mercado
+        // liberado — por isso conta como 1.
+        uint256 quoteIn = quoteIs0 ? p.amount0 : p.amount1;
+        _checkCanOpen(p.tokenId, p.pool, quoteIn == 0 ? 1 : quoteIn);
+
+        InstanceVault vault = _vault(p.tokenId);
+        Minted memory minted = _mintRange(venue.adapter, p, vault, token0, token1);
+        nftId = minted.nftId;
+
+        uint256 fee = venue.feeExempt ? 0 : _fee(p.tokenId, quoteIs0 ? minted.used0 : minted.used1, p.feeBps);
+        if (fee > 0) {
+            _take(vault, p.quote, fee);
+            claimable[treasury][p.quote] += fee;
+        }
+
+        _recordRange(p, minted, quoteIs0 ? token1 : token0, fee);
+    }
+
+    function _recordRange(RangeOpen calldata p, Minted memory m, address base, uint256 fee) private {
+        ranges[p.tokenId][m.nftId] =
+            Range({manager: p.manager, pool: p.pool, base: base, quote: p.quote, liquidity: m.liquidity});
+        emit RangeOpened(p.tokenId, p.manager, m.nftId, p.pool, m.liquidity, m.used0, m.used1, fee, p.decision);
+    }
+
+    /// O que o gerenciador devolveu do `mint`.
+    struct Minted {
+        uint256 nftId;
+        uint128 liquidity;
+        uint256 used0;
+        uint256 used1;
+    }
+
+    /// Tira os valores do cofre, deposita no gerenciador com o cofre como
+    /// dono do NFT e devolve ao cofre o que não entrou.
+    function _mintRange(
+        IV3PositionAdapter adapter,
+        RangeOpen calldata p,
+        InstanceVault vault,
+        address token0,
+        address token1
+    ) private returns (Minted memory m) {
+        uint256 in0 = p.amount0 == 0 ? 0 : _take(vault, token0, p.amount0);
+        uint256 in1 = p.amount1 == 0 ? 0 : _take(vault, token1, p.amount1);
+        IERC20(token0).forceApprove(p.manager, in0);
+        IERC20(token1).forceApprove(p.manager, in1);
+
+        bytes memory data = adapter.mintCall(
+            IV3PositionAdapter.Mint({
+                pool: p.pool,
+                token0: token0,
+                token1: token1,
+                tickLower: p.tickLower,
+                tickUpper: p.tickUpper,
+                amount0Desired: in0,
+                amount1Desired: in1,
+                amount0Min: p.amount0Min,
+                amount1Min: p.amount1Min,
+                recipient: address(vault),
+                deadline: p.deadline
+            })
+        );
+        (bool ok, bytes memory result) = p.manager.call(data);
+        if (!ok) _bubble(result);
+        (m.nftId, m.liquidity, m.used0, m.used1) = abi.decode(result, (uint256, uint128, uint256, uint256));
+
+        IERC20(token0).forceApprove(p.manager, 0);
+        IERC20(token1).forceApprove(p.manager, 0);
+        if (IERC721(p.manager).ownerOf(m.nftId) != address(vault)) revert RangeNotInVault(m.nftId);
+        if (in0 > m.used0) IERC20(token0).safeTransfer(address(vault), in0 - m.used0);
+        if (in1 > m.used1) IERC20(token1).safeTransfer(address(vault), in1 - m.used1);
+    }
+
+    /// Retira a faixa inteira, com a taxa ganha no pool, e queima o NFT. A
+    /// nossa taxa incide sobre a cotação que saiu; o resto volta ao cofre.
+    /// Vale com o gerenciador desabilitado: quem está posicionado sai sempre.
+    function closeRange(RangeClose calldata p) external onlyOperator nonReentrant {
+        if (block.timestamp > p.deadline) revert Expired();
+        if (p.feeBps > volumeFeeBps) revert FeeTooHigh(p.feeBps, volumeFeeBps);
+        Range memory range = ranges[p.tokenId][p.nftId];
+        if (range.manager == address(0)) revert NoRange(p.tokenId, p.nftId);
+        delete ranges[p.tokenId][p.nftId];
+
+        PositionVenue memory venue = positionVenues[range.manager];
+        _checkRangePrice(venue, range.pool);
+        InstanceVault vault = _vault(p.tokenId);
+        (uint256 baseOut, uint256 quoteOut) = _exitRange(
+            vault,
+            range,
+            venue.adapter.exitCall(p.nftId, range.liquidity, p.amount0Min, p.amount1Min, address(this), p.deadline)
+        );
+
+        uint256 fee = venue.feeExempt ? 0 : _fee(p.tokenId, quoteOut, p.feeBps);
+        if (fee > 0) claimable[treasury][range.quote] += fee;
+        if (baseOut > 0) IERC20(range.base).safeTransfer(address(vault), baseOut);
+        if (quoteOut > fee) IERC20(range.quote).safeTransfer(address(vault), quoteOut - fee);
+        emit RangeClosed(p.tokenId, range.manager, p.nftId, baseOut, quoteOut, fee, p.decision);
+    }
+
+    /// O preço atual do pool tem de estar perto do médio. Junto com o próprio
+    /// pool — que só aceita depósito de um lado só fora do preço atual —, isso
+    /// põe uma ordem de venda acima do preço médio e uma de compra abaixo.
+    ///
+    /// Vale também para fechar: se o preço estiver fora, a operadora espera;
+    /// o dono não fica preso, porque saca o NFT do cofre e retira sozinho.
+    function _checkRangePrice(PositionVenue memory venue, address pool) private view {
+        if (venue.twapWindow == 0) return;
+        (int24 spot, int24 mean) = venue.adapter.ticks(pool, venue.twapWindow);
+        int256 gap = int256(spot) - int256(mean);
+        if (gap < 0) gap = -gap;
+        if (uint256(gap) > venue.maxTickDeviation) revert RangePriceDeviation(spot, mean);
+    }
+
+    /// O cofre (dono do NFT) chama o gerenciador; os valores chegam aqui e
+    /// são medidos.
+    function _exitRange(InstanceVault vault, Range memory range, bytes memory exitData)
         private
-        returns (uint256 protocolFee, uint256 partnerFee, uint256 leaderFee)
+        returns (uint256 baseOut, uint256 quoteOut)
     {
-        Pnl storage result = pnl[s.tokenId][s.quote];
-        result.cumulative += tradePnl;
-        if (result.cumulative <= result.highWaterMark) return (0, 0, 0);
-
-        // Lucro novo: só o que passou do melhor resultado anterior. Nunca é
-        // maior que o lucro deste trade, então as taxas cabem no valor
-        // recebido.
-        uint256 profit = uint256(result.cumulative - result.highWaterMark);
-        result.highWaterMark = result.cumulative;
-
-        protocolFee = (profit * profitFeeBps) / BPS;
-        if (s.feeRecipient != address(0)) {
-            partnerFee = (profit * partnerProfitShareBps[s.feeRecipient]) / BPS;
-            // A fatia do parceiro sai da taxa do protocolo; se a taxa foi
-            // reduzida depois, o parceiro não leva mais do que ela.
-            if (partnerFee > protocolFee) partnerFee = protocolFee;
-        }
-
-        Follow memory followed = following[s.tokenId];
-        if (followed.leader != 0) leaderFee = (profit * followed.feeBps) / BPS;
+        uint256 baseBefore = IERC20(range.base).balanceOf(address(this));
+        uint256 quoteBefore = IERC20(range.quote).balanceOf(address(this));
+        vault.execute(range.manager, 0, exitData);
+        baseOut = IERC20(range.base).balanceOf(address(this)) - baseBefore;
+        quoteOut = IERC20(range.quote).balanceOf(address(this)) - quoteBefore;
     }
 
-    /// Quem recebe a taxa de líder: o dono atual do NFT líder. Se o NFT não
-    /// existir mais, a taxa fica com a tesouraria em vez de travar o
-    /// fechamento do seguidor.
-    function _leaderBeneficiary(uint256 leader) private view returns (address) {
-        try nft.ownerOf(leader) returns (address leaderOwner) {
-            return leaderOwner;
-        } catch {
-            return treasury;
-        }
-    }
-
-    // ===== operadora: pelo agregador =====
+    // ===== pelo agregador =====
 
     /// Chave de um par no caminho do agregador. Faz o papel do endereço do
     /// pool: é o que o dono passa a `setMarketAllowed` para liberar o par.
@@ -557,59 +799,6 @@ contract TradeExecutor is Ownable2Step, ReentrancyGuard, ITransferGuard, IUniswa
     function _baseOf(address market) private view returns (address) {
         address base = markets[market].base;
         return base != address(0) ? base : pairs[market].base;
-    }
-
-    /// Abre posição para uma ou mais instâncias trocando pelo agregador.
-    /// Mesmas travas de entrada do pool direto (pausa, mercado liberado pelo
-    /// dono, limite por trade); a diferença é de onde vem o preço.
-    function openViaAggregator(
-        uint256[] calldata tokenIds,
-        Pair calldata pair,
-        uint256[] calldata quoteIns,
-        uint256 minBaseOut,
-        uint256 deadline,
-        Route calldata route
-    ) external onlyOperator nonReentrant {
-        if (block.timestamp > deadline) revert Expired();
-        if (tokenIds.length == 0) revert EmptyBatch();
-        if (quoteIns.length != tokenIds.length) revert LengthMismatch();
-        if (!quoteTokens[pair.quote]) revert QuoteTokenNotAllowed(pair.quote);
-
-        address key = _usePair(pair);
-        Batch memory batch = Batch(key, pair.base, 0, 0);
-        address[] memory owners;
-        uint256[] memory paid;
-        (owners, paid, batch.amountIn) = _pullQuotes(tokenIds, key, quoteIns, pair.quote);
-        batch.amountOut = _aggregatorSwap(key, route, pair.quote, pair.base, batch.amountIn, minBaseOut);
-
-        _recordPositions(tokenIds, owners, paid, batch);
-    }
-
-    /// Fecha a posição de uma ou mais instâncias trocando pelo agregador. Como
-    /// no pool direto, fechar não olha pausa, limites nem a lista de tokens de
-    /// cotação: quem está posicionado precisa conseguir sair.
-    function closeViaAggregator(
-        uint256[] calldata tokenIds,
-        Pair calldata pair,
-        address[] calldata feeRecipients,
-        uint256 minQuoteOut,
-        uint256 deadline,
-        Route calldata route
-    ) external onlyOperator nonReentrant {
-        if (block.timestamp > deadline) revert Expired();
-        if (tokenIds.length == 0) revert EmptyBatch();
-        if (feeRecipients.length != tokenIds.length) revert LengthMismatch();
-
-        address key = pairKey(pair.base, pair.quote);
-        if (pairs[key].base == address(0)) revert InvalidPair();
-
-        Batch memory batch = Batch(key, pair.quote, 0, 0);
-        address[] memory owners;
-        uint256[] memory sold;
-        (owners, sold, batch.amountIn) = _pullPositions(tokenIds, key, pair.base);
-        batch.amountOut = _aggregatorSwap(key, route, pair.base, pair.quote, batch.amountIn, minQuoteOut);
-
-        _settleAll(tokenIds, feeRecipients, owners, sold, batch);
     }
 
     /// Confere o par e registra a chave dele na primeira vez.
@@ -666,7 +855,13 @@ contract TradeExecutor is Ownable2Step, ReentrancyGuard, ITransferGuard, IUniswa
         }
     }
 
-    // ===== saque =====
+    // ===== taxa e saque =====
+
+    /// A taxa de um valor: zero para instância isenta.
+    function _fee(uint256 tokenId, uint256 amount, uint16 feeBps) private view returns (uint256) {
+        if (feeBps == 0 || feeExempt[tokenId]) return 0;
+        return (amount * feeBps) / BPS;
+    }
 
     /// Saca as taxas acumuladas de quem chama, no token indicado. Quem saca
     /// paga o gas.
@@ -680,10 +875,11 @@ contract TradeExecutor is Ownable2Step, ReentrancyGuard, ITransferGuard, IUniswa
 
     // ===== swap e preço =====
 
-    /// Puxa `amount` de `from` e devolve o que de fato chegou.
-    function _pull(address token, address from, uint256 amount) private returns (uint256 received) {
+    /// Tira `amount` do cofre e devolve o que de fato chegou (tokens com taxa
+    /// na transferência entregam menos).
+    function _take(InstanceVault vault, address token, uint256 amount) private returns (uint256 received) {
         uint256 before = IERC20(token).balanceOf(address(this));
-        IERC20(token).safeTransferFrom(from, address(this), amount);
+        vault.transferOut(token, address(this), amount);
         received = IERC20(token).balanceOf(address(this)) - before;
     }
 
@@ -774,7 +970,23 @@ contract TradeExecutor is Ownable2Step, ReentrancyGuard, ITransferGuard, IUniswa
             : FullMath.mulDiv(1 << 128, amountIn, ratioX128);
     }
 
-    // ===== administração (multisig) =====
+    function _bubble(bytes memory reason) private pure {
+        if (reason.length == 0) revert InvalidRange();
+        assembly ("memory-safe") {
+            revert(add(reason, 32), mload(reason))
+        }
+    }
+
+    // ===== administração =====
+
+    /// Isenta (ou deixa de isentar) uma instância da taxa. A operadora também
+    /// pode: isentar só tira receita do protocolo, nunca do usuário, e é o
+    /// que o painel de administração faz com os bots da casa e a whitelist.
+    function setFeeExempt(uint256 tokenId, bool exempt) external {
+        if (msg.sender != owner() && msg.sender != operator) revert NotOperator();
+        feeExempt[tokenId] = exempt;
+        emit FeeExemptSet(tokenId, exempt);
+    }
 
     /// Cadastra ou altera um mercado. Os tokens são conferidos contra o
     /// próprio pool. Desabilitar impede novas entradas; posições abertas
@@ -798,6 +1010,24 @@ contract TradeExecutor is Ownable2Step, ReentrancyGuard, ITransferGuard, IUniswa
         emit MarketSet(pool, base, quote, enabled, twapWindow, maxDeviationBps);
     }
 
+    /// Cadastra um gerenciador de posições de um fork do Uniswap V3: a
+    /// factory dos pools dele e o adaptador que monta as chamadas.
+    function setPositionVenue(address manager, PositionVenue calldata venue) external onlyOwner {
+        if (manager == address(0) || venue.factory == address(0) || address(venue.adapter) == address(0)) {
+            revert ZeroAddress();
+        }
+        positionVenues[manager] = venue;
+        emit PositionVenueSet(
+            manager,
+            venue.factory,
+            address(venue.adapter),
+            venue.enabled,
+            venue.feeExempt,
+            venue.twapWindow,
+            venue.maxTickDeviation
+        );
+    }
+
     function setOperator(address newOperator) external onlyOwner {
         operator = newOperator;
         emit OperatorSet(newOperator);
@@ -809,19 +1039,10 @@ contract TradeExecutor is Ownable2Step, ReentrancyGuard, ITransferGuard, IUniswa
         emit TreasurySet(newTreasury);
     }
 
-    /// A taxa de líder nova só vale para quem começar a seguir depois.
-    function setFees(uint16 newProfitFeeBps, uint16 newLeaderFeeBps) external onlyOwner {
-        if (uint256(newProfitFeeBps) + newLeaderFeeBps > MAX_TOTAL_FEE_BPS) revert InvalidFees();
-        profitFeeBps = newProfitFeeBps;
-        leaderFeeBps = newLeaderFeeBps;
-        emit FeesSet(newProfitFeeBps, newLeaderFeeBps);
-    }
-
-    function setPartnerProfitShare(address partner, uint16 shareBps) external onlyOwner {
-        if (partner == address(0)) revert ZeroAddress();
-        if (shareBps > profitFeeBps) revert InvalidFees();
-        partnerProfitShareBps[partner] = shareBps;
-        emit PartnerProfitShareSet(partner, shareBps);
+    function setVolumeFee(uint16 newVolumeFeeBps) external onlyOwner {
+        if (newVolumeFeeBps > MAX_VOLUME_FEE_BPS) revert FeeTooHigh(newVolumeFeeBps, MAX_VOLUME_FEE_BPS);
+        volumeFeeBps = newVolumeFeeBps;
+        emit VolumeFeeSet(newVolumeFeeBps);
     }
 
     function setAggregator(address target, bool allowed) external onlyOwner {
@@ -849,7 +1070,7 @@ contract TradeExecutor is Ownable2Step, ReentrancyGuard, ITransferGuard, IUniswa
     }
 
     function setLossPause(uint16 newLossPauseBps) external onlyOwner {
-        if (newLossPauseBps > BPS) revert InvalidFees();
+        if (newLossPauseBps > BPS) revert InvalidMarket();
         lossPauseBps = newLossPauseBps;
         emit LossPauseSet(newLossPauseBps);
     }
