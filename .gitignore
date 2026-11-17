@@ -3,3 +3,6 @@ cache/
 lib/
 broadcast/
 .env
+# Endereços de uma chain local: mudam a cada anvil.
+deployments/local.json
+deployments/31337.json
