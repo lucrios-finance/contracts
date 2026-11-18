@@ -128,6 +128,17 @@ anvil &
 forge script script/Local.s.sol --rpc-url http://127.0.0.1:8545 --broadcast
 ```
 
+`MINT_PRICE_WEI` is required, so the NFT is never deployed with a free mint by
+mistake. To price the ETH mint in dollars, add `PRICE_POOL` (a v3 WETH/dollar
+pool with enough observations for the window), `MINT_USD_TOKEN`,
+`MINT_PRICE_USD` (in the dollar token's units: 100 USDG = `100000000`) and,
+optionally, `TWAP_WINDOW` (seconds, default 1800), `MINT_MIN_WEI` and
+`MINT_MAX_WEI` (default half and double `MINT_PRICE_WEI`). The ETH price then
+follows the pool's TWAP, clamped to the bounds, and the dollar token is
+accepted at the same price. `MINT_PRICE_WEI` stays as the fallback if the
+multisig turns dollar pricing off (`setUsdPricing` with pool `address(0)`).
+Apps read the current price with `ethMintPrice()`.
+
 The TypeScript SDK ([`@lucrios/sdk`](https://github.com/lucrios-finance/sdk))
 ships ABIs generated from these contracts; CI fails when they drift apart.
 

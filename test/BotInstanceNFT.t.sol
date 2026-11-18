@@ -5,6 +5,8 @@ import {Test} from "forge-std/Test.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {BotInstanceNFT, ITransferGuard} from "../src/BotInstanceNFT.sol";
+import {TwapPrice} from "../src/TwapPrice.sol";
+import {MockPool, MockWETH} from "./Mocks.sol";
 
 contract MockToken is ERC20 {
     constructor() ERC20("Mock Dollar", "MUSD") {}
@@ -530,5 +532,154 @@ contract BotInstanceNFTTest is Test {
         uint256 tokenId = nft.mint{value: PRICE}(address(0));
         assertEq(tokenId, 3);
         assertEq(nft.ownerOf(3), alice);
+    }
+
+    // ===== preço em dólar =====
+
+    uint256 constant USD_PRICE = 100e6; // 100 USDG (6 casas)
+    uint32 constant WINDOW = 30 minutes;
+
+    /// Pool WETH/USD com o ETH a ~3.000 dólares: o tick depende de qual
+    /// token ficou como token0.
+    function _usdPool() internal returns (MockPool pool, MockWETH weth) {
+        weth = new MockWETH();
+        pool = new MockPool(address(usd), address(weth));
+        // 1 unidade de USD (1e-6) em wei: 1e18 / 3000 / 1e6 ≈ 3,33e8 → tick ≈ 196.250.
+        pool.setTwapTick(pool.token0() == address(usd) ? int24(196_250) : int24(-196_250));
+    }
+
+    function _pricing(MockPool pool, MockWETH weth, uint256 minWei, uint256 maxWei)
+        internal
+        view
+        returns (BotInstanceNFT.UsdPricing memory)
+    {
+        return BotInstanceNFT.UsdPricing({
+            pool: address(pool),
+            usd: address(usd),
+            weth: address(weth),
+            window: WINDOW,
+            usdPrice: USD_PRICE,
+            minWei: minWei,
+            maxWei: maxWei
+        });
+    }
+
+    function test_usdPricingChargesTheTwapValueOfTheDollarPrice() public {
+        (MockPool pool, MockWETH weth) = _usdPool();
+        vm.prank(owner);
+        nft.setUsdPricing(_pricing(pool, weth, 0.01 ether, 0.1 ether));
+
+        uint256 price = nft.ethMintPrice();
+        assertEq(price, TwapPrice.quoteAtTick(pool.twapTick(), address(usd), address(weth), USD_PRICE));
+        // 100 dólares a ~3.000 por ETH.
+        assertApproxEqRel(price, uint256(1 ether) / 30, 0.01e18);
+
+        vm.expectEmit();
+        emit Minted(1, alice, address(0), ETH, price);
+        uint256 before = alice.balance;
+        vm.prank(alice);
+        nft.mint{value: price + 0.01 ether}(address(0));
+        assertEq(alice.balance, before - price);
+        assertEq(nft.claimable(treasury, ETH), price);
+    }
+
+    function test_usdPricingRejectsLessThanTheTwapPrice() public {
+        (MockPool pool, MockWETH weth) = _usdPool();
+        vm.prank(owner);
+        nft.setUsdPricing(_pricing(pool, weth, 0.01 ether, 0.1 ether));
+        uint256 price = nft.ethMintPrice();
+
+        // O preço fixo antigo não vale mais.
+        vm.expectRevert(abi.encodeWithSelector(BotInstanceNFT.WrongPayment.selector, price, price - 1));
+        vm.prank(alice);
+        nft.mint{value: price - 1}(address(0));
+    }
+
+    function test_usdPricingFollowsTheEthPrice() public {
+        (MockPool pool, MockWETH weth) = _usdPool();
+        vm.prank(owner);
+        nft.setUsdPricing(_pricing(pool, weth, 0.001 ether, 1 ether));
+        uint256 before = nft.ethMintPrice();
+
+        // ETH cai pela metade (~6.931 ticks): o mint custa o dobro em ETH.
+        int24 tick = pool.twapTick();
+        pool.setTwapTick(tick > 0 ? tick + 6_931 : tick - 6_931);
+        assertApproxEqRel(nft.ethMintPrice(), before * 2, 0.001e18);
+    }
+
+    function test_usdPricingIsClampedToTheBounds() public {
+        (MockPool pool, MockWETH weth) = _usdPool();
+        vm.prank(owner);
+        nft.setUsdPricing(_pricing(pool, weth, 0.05 ether, 0.06 ether));
+        assertEq(nft.ethMintPrice(), 0.05 ether);
+
+        vm.prank(owner);
+        nft.setUsdPricing(_pricing(pool, weth, 0.001 ether, 0.02 ether));
+        assertEq(nft.ethMintPrice(), 0.02 ether);
+    }
+
+    function test_turningUsdPricingOffGoesBackToTheFixedPrice() public {
+        (MockPool pool, MockWETH weth) = _usdPool();
+        vm.startPrank(owner);
+        nft.setUsdPricing(_pricing(pool, weth, 0.01 ether, 0.1 ether));
+        assertTrue(nft.ethMintPrice() != PRICE);
+
+        BotInstanceNFT.UsdPricing memory off;
+        nft.setUsdPricing(off);
+        vm.stopPrank();
+        assertEq(nft.ethMintPrice(), PRICE);
+    }
+
+    function test_usdPricingStillNeedsEthAccepted() public {
+        (MockPool pool, MockWETH weth) = _usdPool();
+        vm.startPrank(owner);
+        nft.setUsdPricing(_pricing(pool, weth, 0.01 ether, 0.1 ether));
+        nft.setPaymentToken(ETH, false, PRICE);
+        vm.stopPrank();
+
+        vm.expectRevert(abi.encodeWithSelector(BotInstanceNFT.TokenNotAccepted.selector, ETH));
+        vm.prank(alice);
+        nft.mint{value: 1 ether}(address(0));
+    }
+
+    function test_setUsdPricingRejectsBadConfigs() public {
+        (MockPool pool, MockWETH weth) = _usdPool();
+        MockWETH other = new MockWETH();
+        BotInstanceNFT.UsdPricing memory p;
+
+        vm.startPrank(owner);
+        // Pool de outro par.
+        p = _pricing(pool, other, 0.01 ether, 0.1 ether);
+        vm.expectRevert(BotInstanceNFT.InvalidUsdPricing.selector);
+        nft.setUsdPricing(p);
+
+        // Janela curta demais.
+        p = _pricing(pool, weth, 0.01 ether, 0.1 ether);
+        p.window = 60;
+        vm.expectRevert(BotInstanceNFT.InvalidUsdPricing.selector);
+        nft.setUsdPricing(p);
+
+        // Preço zero.
+        p = _pricing(pool, weth, 0.01 ether, 0.1 ether);
+        p.usdPrice = 0;
+        vm.expectRevert(BotInstanceNFT.InvalidUsdPricing.selector);
+        nft.setUsdPricing(p);
+
+        // Sem piso, ou piso acima do teto.
+        p = _pricing(pool, weth, 0, 0.1 ether);
+        vm.expectRevert(BotInstanceNFT.InvalidUsdPricing.selector);
+        nft.setUsdPricing(p);
+        p = _pricing(pool, weth, 0.2 ether, 0.1 ether);
+        vm.expectRevert(BotInstanceNFT.InvalidUsdPricing.selector);
+        nft.setUsdPricing(p);
+        vm.stopPrank();
+    }
+
+    function test_onlyTheMultisigSetsUsdPricing() public {
+        (MockPool pool, MockWETH weth) = _usdPool();
+        BotInstanceNFT.UsdPricing memory p = _pricing(pool, weth, 0.01 ether, 0.1 ether);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
+        vm.prank(alice);
+        nft.setUsdPricing(p);
     }
 }

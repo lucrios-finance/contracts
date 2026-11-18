@@ -10,9 +10,11 @@ import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol
 import {IUniswapV3Pool} from "@uniswap/v3-core/contracts/interfaces/IUniswapV3Pool.sol";
 import {IUniswapV3SwapCallback} from "@uniswap/v3-core/contracts/interfaces/callback/IUniswapV3SwapCallback.sol";
 import {TickMath} from "@uniswap/v3-core/contracts/libraries/TickMath.sol";
-import {FullMath} from "@uniswap/v3-core/contracts/libraries/FullMath.sol";
 import {InstanceVault} from "./InstanceVault.sol";
 import {IV3PositionAdapter} from "./V3PositionAdapters.sol";
+import {TwapPrice} from "./TwapPrice.sol";
+import {RangeMint} from "./RangeMint.sol";
+import {FullMath} from "@uniswap/v3-core/contracts/libraries/FullMath.sol";
 
 interface IWETH {
     function deposit() external payable;
@@ -145,6 +147,24 @@ contract TradeExecutor is Ownable2Step, ReentrancyGuard, IUniswapV3SwapCallback 
         bytes32 decision;
     }
 
+    /// Uma troca dentro do cofre, sem posição: equilibrar os dois lados de
+    /// uma posição de liquidez, converter uma cotação na outra (WETH e USDG)
+    /// e vender o que uma faixa trouxe (stop, cancelamento). O par é o de um
+    /// pool de um gerenciador cadastrado, e o preço médio dele limita a troca.
+    struct VaultSwap {
+        uint256 tokenId;
+        address manager;
+        address pool;
+        /// Um dos dois tokens do pool; a saída é o outro.
+        address tokenIn;
+        uint256 amountIn;
+        /// Mínimo da saída, antes da taxa.
+        uint256 minOut;
+        uint16 feeBps;
+        uint256 deadline;
+        bytes32 decision;
+    }
+
     /// Os parâmetros do fechamento de uma faixa.
     struct RangeClose {
         uint256 tokenId;
@@ -162,6 +182,10 @@ contract TradeExecutor is Ownable2Step, ReentrancyGuard, IUniswapV3SwapCallback 
 
     address public operator;
     address public treasury;
+    /// Quanto uma troca no cofre pode sair pior que o preço médio do pool,
+    /// em pontos-base. Cobre a taxa do pool (na Ramses, até perto de 2%) e o
+    /// impacto de preço.
+    uint16 public vaultSwapDeviationBps = 300;
     /// Taxa máxima por trade, sobre a cotação que entra ou sai. A operadora
     /// informa a de cada trade (zero nos AMMs parceiros), nunca acima desta.
     uint16 public volumeFeeBps;
@@ -240,6 +264,17 @@ contract TradeExecutor is Ownable2Step, ReentrancyGuard, IUniswapV3SwapCallback 
     );
     event RangeDropped(uint256 indexed tokenId, address indexed manager, uint256 indexed nftId);
     event Wrapped(uint256 indexed tokenId, uint256 amount);
+    event VaultSwapped(
+        uint256 indexed tokenId,
+        address indexed pool,
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn,
+        uint256 amountOut,
+        uint256 fee,
+        bytes32 decision
+    );
+    event VaultSwapDeviationSet(uint16 deviationBps);
     event LimitsSet(uint256 indexed tokenId, uint256 maxPerTrade, bool paused, bool anyMarket);
     event MarketAllowedSet(uint256 indexed tokenId, address indexed market, bool allowed);
     event FeeExemptSet(uint256 indexed tokenId, bool exempt);
@@ -298,6 +333,7 @@ contract TradeExecutor is Ownable2Step, ReentrancyGuard, IUniswapV3SwapCallback 
     error RangeStillHeld(uint256 tokenId, uint256 nftId);
     error RangeNotInVault(uint256 nftId);
     error RangePriceDeviation(int24 spot, int24 mean);
+    error DeviationTooHigh(uint16 deviationBps);
 
     modifier onlyInstanceOwner(uint256 tokenId) {
         if (nft.ownerOf(tokenId) != msg.sender) revert NotInstanceOwner(tokenId);
@@ -715,7 +751,7 @@ contract TradeExecutor is Ownable2Step, ReentrancyGuard, IUniswapV3SwapCallback 
         _checkCanOpen(p.tokenId, p.pool, quoteIn == 0 ? 1 : quoteIn);
 
         InstanceVault vault = _vault(p.tokenId);
-        Minted memory minted = _mintRange(venue.adapter, p, vault, token0, token1);
+        RangeMint.Minted memory minted = RangeMint.mint(venue.adapter, p, vault, token0, token1);
         nftId = minted.nftId;
 
         uint256 fee =
@@ -728,58 +764,10 @@ contract TradeExecutor is Ownable2Step, ReentrancyGuard, IUniswapV3SwapCallback 
         _recordRange(p, minted, quoteIs0 ? token1 : token0, fee);
     }
 
-    function _recordRange(RangeOpen calldata p, Minted memory m, address base, uint256 fee) private {
+    function _recordRange(RangeOpen calldata p, RangeMint.Minted memory m, address base, uint256 fee) private {
         ranges[p.tokenId][m.nftId] =
             Range({manager: p.manager, pool: p.pool, base: base, quote: p.quote, liquidity: m.liquidity});
         emit RangeOpened(p.tokenId, p.manager, m.nftId, p.pool, m.liquidity, m.used0, m.used1, fee, p.decision);
-    }
-
-    /// O que o gerenciador devolveu do `mint`.
-    struct Minted {
-        uint256 nftId;
-        uint128 liquidity;
-        uint256 used0;
-        uint256 used1;
-    }
-
-    /// Tira os valores do cofre, deposita no gerenciador com o cofre como
-    /// dono do NFT e devolve ao cofre o que não entrou.
-    function _mintRange(
-        IV3PositionAdapter adapter,
-        RangeOpen calldata p,
-        InstanceVault vault,
-        address token0,
-        address token1
-    ) private returns (Minted memory m) {
-        uint256 in0 = p.amount0 == 0 ? 0 : _take(vault, token0, p.amount0);
-        uint256 in1 = p.amount1 == 0 ? 0 : _take(vault, token1, p.amount1);
-        IERC20(token0).forceApprove(p.manager, in0);
-        IERC20(token1).forceApprove(p.manager, in1);
-
-        bytes memory data = adapter.mintCall(
-            IV3PositionAdapter.Mint({
-                pool: p.pool,
-                token0: token0,
-                token1: token1,
-                tickLower: p.tickLower,
-                tickUpper: p.tickUpper,
-                amount0Desired: in0,
-                amount1Desired: in1,
-                amount0Min: p.amount0Min,
-                amount1Min: p.amount1Min,
-                recipient: address(vault),
-                deadline: p.deadline
-            })
-        );
-        (bool ok, bytes memory result) = p.manager.call(data);
-        if (!ok) _bubble(result);
-        (m.nftId, m.liquidity, m.used0, m.used1) = abi.decode(result, (uint256, uint128, uint256, uint256));
-
-        IERC20(token0).forceApprove(p.manager, 0);
-        IERC20(token1).forceApprove(p.manager, 0);
-        if (IERC721(p.manager).ownerOf(m.nftId) != address(vault)) revert RangeNotInVault(m.nftId);
-        if (in0 > m.used0) IERC20(token0).safeTransfer(address(vault), in0 - m.used0);
-        if (in1 > m.used1) IERC20(token1).safeTransfer(address(vault), in1 - m.used1);
     }
 
     /// Retira a faixa inteira, com a taxa ganha no pool, e queima o NFT. A
@@ -834,6 +822,85 @@ contract TradeExecutor is Ownable2Step, ReentrancyGuard, IUniswapV3SwapCallback 
         vault.execute(range.manager, 0, exitData);
         baseOut = IERC20(range.base).balanceOf(address(this)) - baseBefore;
         quoteOut = IERC20(range.quote).balanceOf(address(this)) - quoteBefore;
+    }
+
+    // ===== operadora: troca no cofre (faixas) =====
+
+    /// Troca `amountIn` de um token do cofre pelo outro token do mesmo pool,
+    /// pelo agregador, e devolve a saída ao cofre. Não registra posição: o
+    /// que entra fica no cofre, para uma faixa ou para o dono.
+    ///
+    /// - Um dos dois lados é sempre um token de cotação aceito.
+    /// - Gastar cotação num ativo é entrada: instância ativa, mercado (o
+    ///   pool) liberado, teto por trade e gerenciador habilitado. Trocar uma
+    ///   cotação pela outra só olha a pausa e o teto.
+    /// - Vender ativo por cotação é saída: vale sempre, como fechar.
+    /// - A saída respeita o preço médio do pool, na tolerância
+    ///   `vaultSwapDeviationBps`. Gerenciador sem janela (pool sem histórico)
+    ///   fica só com o mínimo pedido.
+    /// - A taxa é a da faixa: sobre a cotação, zero no AMM parceiro.
+    function swapInVault(VaultSwap calldata p, Route calldata route) external nonReentrant returns (uint256 amountOut) {
+        if (block.timestamp > p.deadline) revert Expired();
+        if (p.feeBps > volumeFeeBps) revert FeeTooHigh(p.feeBps, volumeFeeBps);
+        uint16 feeBps = _feeFor(p.tokenId, p.feeBps);
+        PositionVenue memory venue = positionVenues[p.manager];
+        address tokenOut = _swapPair(venue, p);
+
+        bool quoteIn = quoteTokens[p.tokenIn];
+        InstanceVault vault = _vault(p.tokenId);
+        uint256 fee;
+        uint256 swapIn = _take(vault, p.tokenIn, p.amountIn);
+        if (quoteIn && !venue.feeExempt) {
+            fee = _fee(p.tokenId, swapIn, feeBps);
+            swapIn -= fee;
+        }
+        amountOut = _aggregatorSwap(address(0), route, p.tokenIn, tokenOut, swapIn, p.minOut);
+        _checkSwapPrice(venue, p.pool, p.tokenIn, tokenOut, swapIn, amountOut);
+        if (!quoteIn && !venue.feeExempt) {
+            fee = _fee(p.tokenId, amountOut, feeBps);
+            amountOut -= fee;
+        }
+        if (fee > 0) claimable[treasury][quoteIn ? p.tokenIn : tokenOut] += fee;
+        IERC20(tokenOut).safeTransfer(address(vault), amountOut);
+        emit VaultSwapped(p.tokenId, p.pool, p.tokenIn, tokenOut, p.amountIn, amountOut, fee, p.decision);
+    }
+
+    /// Confere o par da troca e as travas de entrada. Devolve o token de
+    /// saída.
+    function _swapPair(PositionVenue memory venue, VaultSwap calldata p) private view returns (address tokenOut) {
+        if (address(venue.adapter) == address(0)) revert VenueDisabled(p.manager);
+        (address token0, address token1) = venue.adapter.poolTokens(venue.factory, p.pool);
+        if (p.tokenIn != token0 && p.tokenIn != token1) revert InvalidPair();
+        tokenOut = p.tokenIn == token0 ? token1 : token0;
+
+        bool quoteIn = quoteTokens[p.tokenIn];
+        bool quoteOut = quoteTokens[tokenOut];
+        if (!quoteIn && !quoteOut) revert QuoteTokenNotAllowed(tokenOut);
+        if (!quoteIn) return tokenOut;
+
+        Limits memory limit = limits[p.tokenId];
+        if (quoteOut) {
+            if (limit.paused) revert InstancePaused(p.tokenId);
+            if (p.amountIn > limit.maxPerTrade) revert OverTradeLimit(p.tokenId, p.amountIn, limit.maxPerTrade);
+            return tokenOut;
+        }
+        if (!venue.enabled) revert VenueDisabled(p.manager);
+        _checkCanOpen(p.tokenId, p.pool, p.amountIn);
+    }
+
+    /// A saída de uma troca no cofre contra o preço médio do pool.
+    function _checkSwapPrice(
+        PositionVenue memory venue,
+        address pool,
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn,
+        uint256 amountOut
+    ) private view {
+        if (venue.twapWindow == 0) return;
+        (, int24 mean) = venue.adapter.ticks(pool, venue.twapWindow);
+        uint256 expected = TwapPrice.quoteAtTick(mean, tokenIn, tokenOut, amountIn);
+        if (amountOut * BPS < expected * (BPS - vaultSwapDeviationBps)) revert PriceDeviation(amountOut, expected);
     }
 
     // ===== pelo agregador =====
@@ -897,7 +964,7 @@ contract TradeExecutor is Ownable2Step, ReentrancyGuard, IUniswapV3SwapCallback 
         address priceSource = referencePool[key];
         if (priceSource != address(0)) {
             Market memory market = markets[priceSource];
-            uint256 expected = _quoteAtTwap(priceSource, market.twapWindow, tokenIn, tokenOut, amountIn);
+            uint256 expected = TwapPrice.quoteAtTwap(priceSource, market.twapWindow, tokenIn, tokenOut, amountIn);
             if (amountOut * BPS < expected * (BPS - market.maxDeviationBps)) {
                 revert PriceDeviation(amountOut, expected);
             }
@@ -973,7 +1040,7 @@ contract TradeExecutor is Ownable2Step, ReentrancyGuard, IUniswapV3SwapCallback 
         amountOut = _swap(pool, tokenIn, tokenOut, amountIn);
         if (amountOut < minOut) revert InsufficientOutput(amountOut, minOut);
 
-        uint256 expected = _quoteAtTwap(pool, market.twapWindow, tokenIn, tokenOut, amountIn);
+        uint256 expected = TwapPrice.quoteAtTwap(pool, market.twapWindow, tokenIn, tokenOut, amountIn);
         if (amountOut * BPS < expected * (BPS - market.maxDeviationBps)) revert PriceDeviation(amountOut, expected);
     }
 
@@ -983,47 +1050,6 @@ contract TradeExecutor is Ownable2Step, ReentrancyGuard, IUniswapV3SwapCallback 
         address tokenIn = abi.decode(data, (address));
         uint256 owed = uint256(amount0Delta > 0 ? amount0Delta : amount1Delta);
         IERC20(tokenIn).safeTransfer(msg.sender, owed);
-    }
-
-    /// Quanto de `tokenOut` vale `amountIn` de `tokenIn` ao preço médio da
-    /// janela, sem taxa nem impacto de preço. É a referência que impede uma
-    /// operadora comprometida de mover o preço num bloco, executar contra o
-    /// usuário e desfazer: o preço médio de uma janela não se move com um swap.
-    function _quoteAtTwap(address pool, uint32 window, address tokenIn, address tokenOut, uint256 amountIn)
-        private
-        view
-        returns (uint256)
-    {
-        uint32[] memory secondsAgos = new uint32[](2);
-        secondsAgos[0] = window;
-        (int56[] memory tickCumulatives,) = IUniswapV3Pool(pool).observe(secondsAgos);
-
-        int56 delta = tickCumulatives[1] - tickCumulatives[0];
-        int56 span = int56(uint56(window));
-        int24 meanTick = int24(delta / span);
-        // Arredonda para baixo também nos ticks negativos.
-        if (delta < 0 && (delta % span != 0)) meanTick--;
-
-        uint160 sqrtRatioX96 = TickMath.getSqrtRatioAtTick(meanTick);
-        // sqrtRatio² é o preço de token0 em token1, em Q192. Acima de 2^128 o
-        // quadrado estoura 256 bits, então reduz a precisão para Q128.
-        if (sqrtRatioX96 <= type(uint128).max) {
-            uint256 ratioX192 = uint256(sqrtRatioX96) * sqrtRatioX96;
-            return tokenIn < tokenOut
-                ? FullMath.mulDiv(ratioX192, amountIn, 1 << 192)
-                : FullMath.mulDiv(1 << 192, amountIn, ratioX192);
-        }
-        uint256 ratioX128 = FullMath.mulDiv(sqrtRatioX96, sqrtRatioX96, 1 << 64);
-        return tokenIn < tokenOut
-            ? FullMath.mulDiv(ratioX128, amountIn, 1 << 128)
-            : FullMath.mulDiv(1 << 128, amountIn, ratioX128);
-    }
-
-    function _bubble(bytes memory reason) private pure {
-        if (reason.length == 0) revert InvalidRange();
-        assembly ("memory-safe") {
-            revert(add(reason, 32), mload(reason))
-        }
     }
 
     // ===== administração =====
@@ -1116,6 +1142,12 @@ contract TradeExecutor is Ownable2Step, ReentrancyGuard, IUniswapV3SwapCallback 
         address key = pairKey(base, quote);
         referencePool[key] = pool;
         emit PairReferenceSet(key, pool);
+    }
+
+    function setVaultSwapDeviation(uint16 newDeviationBps) external onlyOwner {
+        if (newDeviationBps > MAX_DEVIATION_BPS) revert DeviationTooHigh(newDeviationBps);
+        vaultSwapDeviationBps = newDeviationBps;
+        emit VaultSwapDeviationSet(newDeviationBps);
     }
 
     function setLossPause(uint16 newLossPauseBps) external onlyOwner {

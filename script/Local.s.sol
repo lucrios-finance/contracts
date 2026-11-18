@@ -4,7 +4,7 @@ pragma solidity 0.8.28;
 import {Script} from "forge-std/Script.sol";
 import {BotInstanceNFT} from "../src/BotInstanceNFT.sol";
 import {TradeExecutor} from "../src/TradeExecutor.sol";
-import {Token, MockWETH, MockAggregator} from "../test/Mocks.sol";
+import {Token, MockWETH, MockAggregator, MockPool} from "../test/Mocks.sol";
 import {Deploy} from "./Deploy.s.sol";
 
 /// Uma chain local pronta para o motor operar pelo cofre, para os testes de
@@ -20,7 +20,9 @@ import {Deploy} from "./Deploy.s.sol";
 ///
 /// Implanta um WETH, um token (MEME) e um agregador de mentira que troca a
 /// um preço fixo (1 WETH = 1.000 MEME, nos dois sentidos), cunha o NFT
-/// 900001, libera 10 WETH por trade e põe no cofre 5 WETH e 1 ETH. Os
+/// 900001, libera 10 WETH por trade e põe no cofre 5 WETH e 1 ETH. O mint
+/// custa 100 USDG (de mentira, 18 casas), convertidos pelo preço médio de
+/// um pool WETH/USDG de mentira com o ETH a ~3.000 dólares. Os
 /// endereços vão para `deployments/local.json`.
 contract Local is Deploy {
     uint256 constant DEPLOYER_KEY = 0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80;
@@ -47,6 +49,20 @@ contract Local is Deploy {
         aggregators[0] = address(aggregator);
         address[] memory quotes = new address[](1);
         quotes[0] = address(weth);
+        Token usdg = new Token("USDG");
+        MockPool pricePool = new MockPool(address(usdg), address(weth));
+        // ~3.000 USDG por WETH, os dois com 18 casas: ln(1/3000)/ln(1,0001).
+        pricePool.setTwapTick(pricePool.token0() == address(usdg) ? int24(-80_067) : int24(80_067));
+        BotInstanceNFT.UsdPricing memory usdPricing = BotInstanceNFT.UsdPricing({
+            pool: address(pricePool),
+            usd: address(usdg),
+            weth: address(weth),
+            window: 30 minutes,
+            usdPrice: 100e18,
+            minWei: 0.01 ether,
+            maxWei: 0.1 ether
+        });
+
         Config memory config = Config({
             owner: deployer,
             treasury: deployer,
@@ -54,8 +70,10 @@ contract Local is Deploy {
             weth: address(weth),
             volumeFeeBps: VOLUME_FEE_BPS,
             maxSupply: 10_000,
+            mintPrice: 0.01 ether,
             aggregators: aggregators,
-            quoteTokens: quotes
+            quoteTokens: quotes,
+            usdPricing: usdPricing
         });
         (nft, executor) = deploy(config, deployer);
 
@@ -76,6 +94,7 @@ contract Local is Deploy {
         vm.serializeJson(key, vm.readFile(_path(vm.toString(block.chainid))));
         vm.serializeAddress(key, "meme", address(meme));
         vm.serializeAddress(key, "aggregator", address(aggregator));
+        vm.serializeAddress(key, "usdg", address(usdg));
         vm.serializeAddress(key, "vault", vault);
         vm.serializeAddress(key, "houseOwner", houseOwner);
         vm.serializeUint(key, "houseBot", HOUSE_BOT);
