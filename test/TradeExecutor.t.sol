@@ -193,7 +193,7 @@ contract TradeExecutorTest is Test {
         assertEq(weth.balanceOf(vault), 2 ether);
         assertEq(vault.balance, 0);
 
-        vm.expectRevert(TradeExecutor.NotOperator.selector);
+        vm.expectRevert(abi.encodeWithSelector(TradeExecutor.NotSigner.selector, ALICE));
         vm.prank(alice);
         executor.wrapNative(ALICE);
     }
@@ -220,12 +220,12 @@ contract TradeExecutorTest is Test {
     }
 
     function test_onlyTheOperatorTrades() public {
-        vm.expectRevert(TradeExecutor.NotOperator.selector);
+        vm.expectRevert(abi.encodeWithSelector(TradeExecutor.NotSigner.selector, ALICE));
         vm.prank(alice);
         executor.openPositions(_one(ALICE), address(pool), _one(1_000e18), 0, FEE, block.timestamp, DECISION);
 
         _open(ALICE, 1_000e18);
-        vm.expectRevert(TradeExecutor.NotOperator.selector);
+        vm.expectRevert(abi.encodeWithSelector(TradeExecutor.NotSigner.selector, ALICE));
         vm.prank(alice);
         executor.closePositions(_one(ALICE), address(pool), 0, FEE, block.timestamp, DECISION);
     }
@@ -622,7 +622,7 @@ contract TradeExecutorTest is Test {
         vm.prank(multisig);
         executor.setOperator(next);
 
-        vm.expectRevert(TradeExecutor.NotOperator.selector);
+        vm.expectRevert(abi.encodeWithSelector(TradeExecutor.NotSigner.selector, ALICE));
         _open(ALICE, 1_000e18);
 
         vm.prank(next);

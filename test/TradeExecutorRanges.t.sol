@@ -252,13 +252,13 @@ contract TradeExecutorRangesTest is Test {
 
     function test_onlyTheOperatorOpensAndCloses() public {
         TradeExecutor.RangeOpen memory p = _params(ramses, 1_000e18, 0);
-        vm.expectRevert(TradeExecutor.NotOperator.selector);
+        vm.expectRevert(abi.encodeWithSelector(TradeExecutor.NotSigner.selector, ALICE));
         vm.prank(alice);
         executor.openRange(p);
 
         uint256 nftId = _openRange(ramses, 1_000e18, 0);
         TradeExecutor.RangeClose memory c = _closeParams(nftId);
-        vm.expectRevert(TradeExecutor.NotOperator.selector);
+        vm.expectRevert(abi.encodeWithSelector(TradeExecutor.NotSigner.selector, ALICE));
         vm.prank(alice);
         executor.closeRange(c);
     }

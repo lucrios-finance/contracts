@@ -133,7 +133,7 @@ contract TradeExecutorAggregatorTest is Test {
     }
 
     function test_onlyTheOperatorTrades() public {
-        vm.expectRevert(TradeExecutor.NotOperator.selector);
+        vm.expectRevert(abi.encodeWithSelector(TradeExecutor.NotSigner.selector, ALICE));
         vm.prank(alice);
         executor.openViaAggregator(
             _one(ALICE),

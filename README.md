@@ -35,9 +35,12 @@ executor, so no executor rule can hold funds back. If the owner withdraws
 the asset of an open position, the executor sells what is left; if nothing
 is left, the position is dropped.
 
-Only the operator wallet (the backend signer) starts trades. It decides; the
-contracts limit and record. What a compromised operator can do is limited
-on-chain:
+Trades are started by the operator wallet (the backend signer, replaceable by
+the multisig with `setOperator`) or by one signer the instance owner chooses
+with `setSigner` — their own system, for instance. The delegation belongs to
+the owner who made it: a buyer of the NFT does not inherit it, and
+`address(0)` revokes it. Whoever signs decides; the contracts limit and record.
+What a compromised operator or signer can do is limited on-chain:
 
 - the result of a trade only goes to the vault of the instance;
 - the owner sets a maximum per trade and the markets the instance may trade
@@ -78,7 +81,8 @@ decision that was published for it.
 
 A volume fee on the quote token that enters or leaves each trade, taken from
 the trade itself. The operator passes the fee of each trade (zero on partner
-venues) and the contract refuses anything above `volumeFeeBps`. Instances
+venues) and the contract refuses anything above `volumeFeeBps`; an owner's
+signer always pays `volumeFeeBps`. Instances
 marked `feeExempt` and position venues marked `feeExempt` pay nothing. Fees
 accrue as claimable balances and are withdrawn by the treasury.
 

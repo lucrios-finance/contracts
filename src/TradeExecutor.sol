@@ -177,6 +177,16 @@ contract TradeExecutor is Ownable2Step, ReentrancyGuard, IUniswapV3SwapCallback 
     /// Instâncias que não pagam taxa (as da casa, as da whitelist).
     mapping(uint256 tokenId => bool) public feeExempt;
 
+    /// Um assinante escolhido pelo dono da instância, além da operadora. A
+    /// delegação guarda quem delegou e só vale enquanto ele for o dono: quem
+    /// compra a NFT não herda o assinante do vendedor.
+    struct Delegation {
+        address owner;
+        address signer;
+    }
+
+    mapping(uint256 tokenId => Delegation) private _delegations;
+
     /// Taxas acumuladas e ainda não sacadas, por beneficiário e por token.
     mapping(address account => mapping(address token => uint256)) public claimable;
 
@@ -233,6 +243,7 @@ contract TradeExecutor is Ownable2Step, ReentrancyGuard, IUniswapV3SwapCallback 
     event LimitsSet(uint256 indexed tokenId, uint256 maxPerTrade, bool paused, bool anyMarket);
     event MarketAllowedSet(uint256 indexed tokenId, address indexed market, bool allowed);
     event FeeExemptSet(uint256 indexed tokenId, bool exempt);
+    event SignerSet(uint256 indexed tokenId, address indexed owner, address signer);
     event Withdrawn(address indexed account, address indexed token, uint256 amount);
     event MarketSet(
         address indexed pool, address base, address quote, bool enabled, uint32 twapWindow, uint16 maxDeviationBps
@@ -256,6 +267,7 @@ contract TradeExecutor is Ownable2Step, ReentrancyGuard, IUniswapV3SwapCallback 
     event InstanceAutoPaused(uint256 indexed tokenId, address indexed market, uint256 cost, uint256 proceeds);
 
     error NotOperator();
+    error NotSigner(uint256 tokenId);
     error NotInstanceOwner(uint256 tokenId);
     error Expired();
     error LengthMismatch();
@@ -286,11 +298,6 @@ contract TradeExecutor is Ownable2Step, ReentrancyGuard, IUniswapV3SwapCallback 
     error RangeStillHeld(uint256 tokenId, uint256 nftId);
     error RangeNotInVault(uint256 nftId);
     error RangePriceDeviation(int24 spot, int24 mean);
-
-    modifier onlyOperator() {
-        if (msg.sender != operator) revert NotOperator();
-        _;
-    }
 
     modifier onlyInstanceOwner(uint256 tokenId) {
         if (nft.ownerOf(tokenId) != msg.sender) revert NotInstanceOwner(tokenId);
@@ -346,7 +353,8 @@ contract TradeExecutor is Ownable2Step, ReentrancyGuard, IUniswapV3SwapCallback 
 
     /// Embrulha o ETH do cofre em WETH, para a instância poder operar com
     /// ele. Depositar ETH puro no cofre é o caminho mais simples para o dono.
-    function wrapNative(uint256 tokenId) external onlyOperator nonReentrant {
+    function wrapNative(uint256 tokenId) external nonReentrant {
+        _feeFor(tokenId, 0);
         InstanceVault vault = _vault(tokenId);
         uint256 amount = address(vault).balance;
         if (amount == 0) revert ZeroAmount();
@@ -367,6 +375,23 @@ contract TradeExecutor is Ownable2Step, ReentrancyGuard, IUniswapV3SwapCallback 
     function setMarketAllowed(uint256 tokenId, address market, bool allowed) external onlyInstanceOwner(tokenId) {
         marketAllowed[tokenId][market] = allowed;
         emit MarketAllowedSet(tokenId, market, allowed);
+    }
+
+    /// Escolhe quem, além da operadora, pode operar esta instância: abrir e
+    /// fechar posições e faixas e embrulhar ETH, com as mesmas travas da
+    /// operadora (limites, mercados liberados, agregadores, preço médio) e
+    /// sempre com a taxa cheia. `address(0)` revoga.
+    function setSigner(uint256 tokenId, address signer) external onlyInstanceOwner(tokenId) {
+        _delegations[tokenId] = Delegation({owner: msg.sender, signer: signer});
+        emit SignerSet(tokenId, msg.sender, signer);
+    }
+
+    /// O assinante em vigor; `address(0)` se não há, ou se a NFT mudou de
+    /// dono depois da delegação.
+    function signerOf(uint256 tokenId) public view returns (address) {
+        Delegation memory delegation = _delegations[tokenId];
+        if (delegation.signer == address(0) || nft.ownerOf(tokenId) != delegation.owner) return address(0);
+        return delegation.signer;
     }
 
     /// Esquece uma posição sem vender: o ativo continua no cofre, e o dono
@@ -442,8 +467,9 @@ contract TradeExecutor is Ownable2Step, ReentrancyGuard, IUniswapV3SwapCallback 
         uint16 feeBps,
         uint256 deadline,
         bytes32 decision
-    ) external onlyOperator nonReentrant {
+    ) external nonReentrant {
         _checkBatch(tokenIds.length, quoteIns.length, deadline, feeBps);
+        feeBps = _feeFor(tokenIds, feeBps);
         Market memory market = markets[pool];
         if (!market.enabled) revert MarketDisabled(pool);
 
@@ -464,8 +490,9 @@ contract TradeExecutor is Ownable2Step, ReentrancyGuard, IUniswapV3SwapCallback 
         uint256 deadline,
         bytes32 decision,
         Route calldata route
-    ) external onlyOperator nonReentrant {
+    ) external nonReentrant {
         _checkBatch(tokenIds.length, quoteIns.length, deadline, feeBps);
+        feeBps = _feeFor(tokenIds, feeBps);
         if (!quoteTokens[pair.quote]) revert QuoteTokenNotAllowed(pair.quote);
 
         address key = _usePair(pair);
@@ -473,6 +500,23 @@ contract TradeExecutor is Ownable2Step, ReentrancyGuard, IUniswapV3SwapCallback 
         Shares memory shares = _takeQuotes(tokenIds, quoteIns, batch);
         batch.amountOut = _aggregatorSwap(key, route, pair.quote, pair.base, batch.amountIn, minBaseOut);
         _recordPositions(tokenIds, shares, batch);
+    }
+
+    /// Quem pode operar estas instâncias e com que taxa. A operadora informa
+    /// a taxa de cada trade (zero nos AMMs parceiros); o assinante de um dono
+    /// paga sempre a taxa cheia, ou a isenção ficaria na mão de quem paga.
+    function _feeFor(uint256[] calldata tokenIds, uint16 feeBps) private view returns (uint16) {
+        if (msg.sender == operator) return feeBps;
+        for (uint256 i = 0; i < tokenIds.length; i++) {
+            if (signerOf(tokenIds[i]) != msg.sender) revert NotSigner(tokenIds[i]);
+        }
+        return volumeFeeBps;
+    }
+
+    function _feeFor(uint256 tokenId, uint16 feeBps) private view returns (uint16) {
+        if (msg.sender == operator) return feeBps;
+        if (signerOf(tokenId) != msg.sender) revert NotSigner(tokenId);
+        return volumeFeeBps;
     }
 
     function _checkBatch(uint256 count, uint256 otherCount, uint256 deadline, uint16 feeBps) private view {
@@ -548,8 +592,9 @@ contract TradeExecutor is Ownable2Step, ReentrancyGuard, IUniswapV3SwapCallback 
         uint16 feeBps,
         uint256 deadline,
         bytes32 decision
-    ) external onlyOperator nonReentrant {
+    ) external nonReentrant {
         _checkBatch(tokenIds.length, tokenIds.length, deadline, feeBps);
+        feeBps = _feeFor(tokenIds, feeBps);
         Market memory market = markets[pool];
         if (market.base == address(0)) revert InvalidMarket();
 
@@ -569,8 +614,9 @@ contract TradeExecutor is Ownable2Step, ReentrancyGuard, IUniswapV3SwapCallback 
         uint256 deadline,
         bytes32 decision,
         Route calldata route
-    ) external onlyOperator nonReentrant {
+    ) external nonReentrant {
         _checkBatch(tokenIds.length, tokenIds.length, deadline, feeBps);
+        feeBps = _feeFor(tokenIds, feeBps);
         address key = pairKey(pair.base, pair.quote);
         if (pairs[key].base == address(0)) revert InvalidPair();
 
@@ -648,9 +694,10 @@ contract TradeExecutor is Ownable2Step, ReentrancyGuard, IUniswapV3SwapCallback 
     /// Abre uma faixa num pool de um fork do Uniswap V3 cadastrado. O NFT da
     /// faixa nasce no cofre. A taxa incide sobre a cotação que de fato entrou
     /// na faixa, e é tirada do cofre à parte.
-    function openRange(RangeOpen calldata p) external onlyOperator nonReentrant returns (uint256 nftId) {
+    function openRange(RangeOpen calldata p) external nonReentrant returns (uint256 nftId) {
         if (block.timestamp > p.deadline) revert Expired();
         if (p.feeBps > volumeFeeBps) revert FeeTooHigh(p.feeBps, volumeFeeBps);
+        _feeFor(p.tokenId, p.feeBps);
         PositionVenue memory venue = positionVenues[p.manager];
         if (!venue.enabled) revert VenueDisabled(p.manager);
 
@@ -671,7 +718,8 @@ contract TradeExecutor is Ownable2Step, ReentrancyGuard, IUniswapV3SwapCallback 
         Minted memory minted = _mintRange(venue.adapter, p, vault, token0, token1);
         nftId = minted.nftId;
 
-        uint256 fee = venue.feeExempt ? 0 : _fee(p.tokenId, quoteIs0 ? minted.used0 : minted.used1, p.feeBps);
+        uint256 fee =
+            venue.feeExempt ? 0 : _fee(p.tokenId, quoteIs0 ? minted.used0 : minted.used1, _feeFor(p.tokenId, p.feeBps));
         if (fee > 0) {
             _take(vault, p.quote, fee);
             claimable[treasury][p.quote] += fee;
@@ -737,9 +785,10 @@ contract TradeExecutor is Ownable2Step, ReentrancyGuard, IUniswapV3SwapCallback 
     /// Retira a faixa inteira, com a taxa ganha no pool, e queima o NFT. A
     /// nossa taxa incide sobre a cotação que saiu; o resto volta ao cofre.
     /// Vale com o gerenciador desabilitado: quem está posicionado sai sempre.
-    function closeRange(RangeClose calldata p) external onlyOperator nonReentrant {
+    function closeRange(RangeClose calldata p) external nonReentrant {
         if (block.timestamp > p.deadline) revert Expired();
         if (p.feeBps > volumeFeeBps) revert FeeTooHigh(p.feeBps, volumeFeeBps);
+        uint16 feeBps = _feeFor(p.tokenId, p.feeBps);
         Range memory range = ranges[p.tokenId][p.nftId];
         if (range.manager == address(0)) revert NoRange(p.tokenId, p.nftId);
         delete ranges[p.tokenId][p.nftId];
@@ -753,7 +802,7 @@ contract TradeExecutor is Ownable2Step, ReentrancyGuard, IUniswapV3SwapCallback 
             venue.adapter.exitCall(p.nftId, range.liquidity, p.amount0Min, p.amount1Min, address(this), p.deadline)
         );
 
-        uint256 fee = venue.feeExempt ? 0 : _fee(p.tokenId, quoteOut, p.feeBps);
+        uint256 fee = venue.feeExempt ? 0 : _fee(p.tokenId, quoteOut, feeBps);
         if (fee > 0) claimable[treasury][range.quote] += fee;
         if (baseOut > 0) IERC20(range.base).safeTransfer(address(vault), baseOut);
         if (quoteOut > fee) IERC20(range.quote).safeTransfer(address(vault), quoteOut - fee);
