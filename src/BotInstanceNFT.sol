@@ -7,6 +7,12 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import {InstanceArt} from "./InstanceArt.sol";
+import {TwapPrice} from "./TwapPrice.sol";
+
+interface IPoolTokens {
+    function token0() external view returns (address);
+    function token1() external view returns (address);
+}
 
 /// Consultado antes de cada transferência de NFT, se configurado. O executor
 /// atual não precisa: os fundos de uma instância ficam no cofre dela, que
@@ -37,6 +43,31 @@ contract BotInstanceNFT is ERC721, Ownable2Step, ReentrancyGuard {
         uint256 mintPrice;
     }
 
+    /// Preço do mint em ETH fixado em dólar: o valor em wei sai do preço
+    /// médio (TWAP) de um pool v3 WETH/dólar a cada mint. `pool == 0` desliga,
+    /// e vale o preço fixo de `paymentTokens[ETH]`.
+    ///
+    /// O preço médio de uma janela não se move com um swap, mas um pool raso
+    /// pode ser empurrado por uma janela inteira. Por isso o resultado fica
+    /// preso entre `minWei` e `maxWei`: quem manipular o pool para mintar
+    /// barato paga no mínimo `minWei`.
+    struct UsdPricing {
+        address pool;
+        /// O token de dólar do pool (USDG) e o WETH, o outro lado.
+        address usd;
+        address weth;
+        /// Janela do preço médio, em segundos.
+        uint32 window;
+        /// Preço do mint em unidades do token de dólar (100 USDG = 100e6).
+        uint256 usdPrice;
+        uint256 minWei;
+        uint256 maxWei;
+    }
+
+    /// Janela mínima do preço médio: abaixo disso ele fica perto do preço
+    /// do bloco, que um swap move.
+    uint32 public constant MIN_TWAP_WINDOW = 5 minutes;
+
     uint256 public totalMinted;
     /// Teto de instâncias da rodada vigente. Só sobe.
     uint256 public maxSupply;
@@ -60,6 +91,8 @@ contract BotInstanceNFT is ERC721, Ownable2Step, ReentrancyGuard {
 
     ITransferGuard public transferGuard;
 
+    UsdPricing public usdPricing;
+
     /// Quem cunha instâncias de graça, com o id escolhido: o backend, ao
     /// criar um agente, e o multisig. O id é o mesmo da instância no backend.
     address public minter;
@@ -79,6 +112,9 @@ contract BotInstanceNFT is ERC721, Ownable2Step, ReentrancyGuard {
     event PartnerSharesSet(address indexed partner, uint256 mintShareBps, uint256 topUpShareBps);
     event TransferGuardSet(address guard);
     event MinterSet(address minter);
+    event UsdPricingSet(
+        address indexed pool, address usd, address weth, uint32 window, uint256 usdPrice, uint256 minWei, uint256 maxWei
+    );
 
     error SoldOut();
     error TokenNotAccepted(address token);
@@ -93,6 +129,7 @@ contract BotInstanceNFT is ERC721, Ownable2Step, ReentrancyGuard {
     error InstanceLocked(uint256 tokenId);
     error NotMinter();
     error TokenIdTaken(uint256 tokenId);
+    error InvalidUsdPricing();
 
     constructor(address initialOwner, address treasury_, uint256 maxSupply_, uint256 ethMintPrice)
         ERC721("Lucrios Bot", "LUCRIOS")
@@ -118,15 +155,27 @@ contract BotInstanceNFT is ERC721, Ownable2Step, ReentrancyGuard {
     /// para o backend saber por qual parceiro a instância entrou, e recebe a
     /// fatia de mint que estiver configurada para ele.
     function mint(address feeRecipient) external payable nonReentrant returns (uint256 tokenId) {
-        PaymentToken memory payment = paymentTokens[ETH];
-        if (!payment.accepted) revert TokenNotAccepted(ETH);
-        if (msg.value < payment.mintPrice) revert WrongPayment(payment.mintPrice, msg.value);
+        if (!paymentTokens[ETH].accepted) revert TokenNotAccepted(ETH);
+        uint256 price = ethMintPrice();
+        if (msg.value < price) revert WrongPayment(price, msg.value);
 
-        tokenId = _mintInstance(msg.sender, feeRecipient, ETH, payment.mintPrice);
-        _distribute(ETH, payment.mintPrice, feeRecipient, partnerMintShareBps[feeRecipient]);
+        tokenId = _mintInstance(msg.sender, feeRecipient, ETH, price);
+        _distribute(ETH, price, feeRecipient, partnerMintShareBps[feeRecipient]);
 
-        uint256 excess = msg.value - payment.mintPrice;
+        uint256 excess = msg.value - price;
         if (excess > 0) _sendEth(msg.sender, excess);
+    }
+
+    /// Preço do mint em ETH agora, em wei. Com o preço em dólar ligado, muda
+    /// com o ETH: quem monta a transação manda um pouco a mais e recebe o
+    /// troco.
+    function ethMintPrice() public view returns (uint256 price) {
+        UsdPricing memory pricing = usdPricing;
+        if (pricing.pool == address(0)) return paymentTokens[ETH].mintPrice;
+
+        price = TwapPrice.quoteAtTwap(pricing.pool, pricing.window, pricing.usd, pricing.weth, pricing.usdPrice);
+        if (price < pricing.minWei) price = pricing.minWei;
+        else if (price > pricing.maxWei) price = pricing.maxWei;
     }
 
     /// Minta pagando num token aceito. Exige `approve` do preço para este
@@ -257,6 +306,27 @@ contract BotInstanceNFT is ERC721, Ownable2Step, ReentrancyGuard {
     function setPaymentToken(address token, bool accepted, uint256 mintPrice) external onlyOwner {
         paymentTokens[token] = PaymentToken({accepted: accepted, mintPrice: mintPrice});
         emit PaymentTokenSet(token, accepted, mintPrice);
+    }
+
+    /// Liga o preço em dólar do mint em ETH; `pool == address(0)` desliga e
+    /// volta ao preço fixo. Consulta o pool na hora: um pool sem histórico
+    /// para a janela (cardinalidade baixa) é recusado aqui, não no mint.
+    function setUsdPricing(UsdPricing calldata pricing) external onlyOwner {
+        if (pricing.pool != address(0)) {
+            address token0 = IPoolTokens(pricing.pool).token0();
+            address token1 = IPoolTokens(pricing.pool).token1();
+            bool pair =
+                (token0 == pricing.usd && token1 == pricing.weth) || (token0 == pricing.weth && token1 == pricing.usd);
+            if (
+                !pair || pricing.window < MIN_TWAP_WINDOW || pricing.usdPrice == 0 || pricing.minWei == 0
+                    || pricing.minWei > pricing.maxWei
+            ) revert InvalidUsdPricing();
+        }
+        usdPricing = pricing;
+        emit UsdPricingSet(
+            pricing.pool, pricing.usd, pricing.weth, pricing.window, pricing.usdPrice, pricing.minWei, pricing.maxWei
+        );
+        if (pricing.pool != address(0)) ethMintPrice();
     }
 
     function setMaxSupply(uint256 newMaxSupply) external onlyOwner {
