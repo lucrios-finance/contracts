@@ -54,6 +54,7 @@ contract Local is Deploy {
             weth: address(weth),
             volumeFeeBps: VOLUME_FEE_BPS,
             maxSupply: 10_000,
+            mintPrice: 0.01 ether,
             aggregators: aggregators,
             quoteTokens: quotes
         });

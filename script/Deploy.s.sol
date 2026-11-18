@@ -13,7 +13,10 @@ import {TradeExecutor} from "../src/TradeExecutor.sol";
 ///
 /// Variáveis: OWNER (multisig), TREASURY, OPERATOR (a chave do motor, também
 /// `minter` do NFT), WETH, VOLUME_FEE_BPS, AGGREGATORS e QUOTE_TOKENS
-/// (endereços separados por vírgula) e, opcional, MAX_SUPPLY.
+/// (endereços separados por vírgula), MINT_PRICE_WEI (o preço do mint em
+/// ETH, em wei; obrigatório, para o NFT não nascer grátis por esquecimento)
+/// e, opcional, MAX_SUPPLY. Depois, o multisig muda o preço (e aceita outros
+/// tokens, como o USDG) com `setPaymentToken`.
 ///
 /// A configuração é feita com o deployer como dono; no fim a posse passa
 /// ao OWNER em dois passos (`Ownable2Step`): ele precisa chamar
@@ -29,6 +32,8 @@ contract Deploy is Script {
         address weth;
         uint16 volumeFeeBps;
         uint256 maxSupply;
+        /// Preço do mint em ETH, em wei.
+        uint256 mintPrice;
         address[] aggregators;
         address[] quoteTokens;
     }
@@ -46,6 +51,7 @@ contract Deploy is Script {
             weth: vm.envAddress("WETH"),
             volumeFeeBps: uint16(vm.envUint("VOLUME_FEE_BPS")),
             maxSupply: vm.envOr("MAX_SUPPLY", uint256(10_000)),
+            mintPrice: vm.envUint("MINT_PRICE_WEI"),
             aggregators: vm.envAddress("AGGREGATORS", ","),
             quoteTokens: vm.envAddress("QUOTE_TOKENS", ",")
         });
@@ -68,8 +74,9 @@ contract Deploy is Script {
         public
         returns (BotInstanceNFT nft, TradeExecutor executor)
     {
-        // Mint público grátis: o NFT pago saiu do plano.
-        nft = new BotInstanceNFT(deployer, config.treasury, config.maxSupply, 0);
+        // Mint pago em ETH; o id escolhido pelo motor (`mintTo`) continua
+        // grátis para o minter.
+        nft = new BotInstanceNFT(deployer, config.treasury, config.maxSupply, config.mintPrice);
         executor = new TradeExecutor(
             deployer, IERC721(address(nft)), config.weth, config.operator, config.treasury, config.volumeFeeBps
         );
@@ -98,6 +105,7 @@ contract Deploy is Script {
         vm.serializeAddress(key, "operator", config.operator);
         vm.serializeAddress(key, "weth", config.weth);
         vm.serializeUint(key, "volumeFeeBps", config.volumeFeeBps);
+        vm.serializeUint(key, "mintPriceWei", config.mintPrice);
         vm.serializeAddress(key, "nft", address(nft));
         string memory json = vm.serializeAddress(key, "executor", address(executor));
         vm.writeJson(json, string.concat(vm.projectRoot(), "/deployments/", vm.toString(block.chainid), ".json"));
